@@ -165,7 +165,7 @@
       const account = accounts.find((item) => item.id === id);
       row.querySelector(".toggle-enabled").addEventListener("change", async (event) => {
         try {
-          await api(`/admin/accounts/${id}`, {
+          await api(`admin/accounts/${id}`, {
             method: "PATCH",
             body: JSON.stringify({ enabled: event.target.checked }),
           });
@@ -186,7 +186,7 @@
     try {
       if (act === "export") {
         if (!confirm("导出文件包含完整密钥及 OAuth 会话，请仅保存在可信设备。是否继续？")) return;
-        const payload = await api(`/admin/accounts/${encodeURIComponent(account.id)}/export`);
+        const payload = await api(`admin/accounts/${encodeURIComponent(account.id)}/export`);
         const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
         const link = document.createElement("a");
         link.href = url;
@@ -201,13 +201,13 @@
       }
       if (act === "delete") {
         if (!confirm(`确定删除账号「${account.name}」吗？此操作不可撤销。`)) return;
-        await api(`/admin/accounts/${account.id}`, { method: "DELETE" });
+        await api(`admin/accounts/${account.id}`, { method: "DELETE" });
         toast("账号已删除");
         await loadAll();
         return;
       }
       if (act === "test") {
-        const result = await api(`/admin/accounts/${account.id}/test`, { method: "POST" });
+        const result = await api(`admin/accounts/${account.id}/test`, { method: "POST" });
         toast(result.ok ? `探测成功：${result.account_type || "ok"}` : `探测失败：${result.message || "error"}`);
         return;
       }
@@ -216,7 +216,7 @@
         return;
       }
       if (act === "checkin") {
-        await api("/admin/checkin", { method: "POST", body: JSON.stringify({ account_id: account.id }) });
+        await api("admin/checkin", { method: "POST", body: JSON.stringify({ account_id: account.id }) });
         toast(`已为 ${account.name} 执行签到`);
         await loadAll();
       }
@@ -234,7 +234,7 @@
         throw new Error("最多导入 100 个文件，总计不超过 4 MiB");
       }
       const files = await Promise.all(selected.map(async (file) => JSON.parse(await file.text())));
-      await api("/admin/accounts/import", { method: "POST", body: JSON.stringify({ files }) });
+      await api("admin/accounts/import", { method: "POST", body: JSON.stringify({ files }) });
       toast("Auth 文件已导入");
       await loadAll();
     } catch (err) { toast(err.message); }
@@ -292,10 +292,10 @@
     }
     try {
       if (id) {
-        await api(`/admin/accounts/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
+        await api(`admin/accounts/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
         toast("账号已更新");
       } else {
-        await api("/admin/accounts", { method: "POST", body: JSON.stringify(payload) });
+        await api("admin/accounts", { method: "POST", body: JSON.stringify(payload) });
         toast("账号已添加");
       }
       accountDialog.close();
@@ -313,12 +313,12 @@
     $("oauth-callback").textContent = "";
     loginDialog.showModal();
     try {
-      const data = await api(`/admin/accounts/${account.id}/login`, { method: "POST" });
+      const data = await api(`admin/accounts/${account.id}/login`, { method: "POST" });
       showOauthStatus(data);
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(async () => {
         try {
-          const status = await api(`/admin/accounts/${account.id}/login`);
+          const status = await api(`admin/accounts/${account.id}/login`);
           showOauthStatus(status);
           if (status.status === "logged_in" || status.status === "error" || status.status === "idle") {
             clearInterval(pollTimer);
@@ -400,7 +400,7 @@
     $("checkin-accounts").querySelectorAll("[data-checkin]").forEach((button) => {
       button.addEventListener("click", async () => {
         try {
-          await api("/admin/checkin", { method: "POST", body: JSON.stringify({ account_id: button.dataset.checkin }) });
+          await api("admin/checkin", { method: "POST", body: JSON.stringify({ account_id: button.dataset.checkin }) });
           toast("签到已执行");
           await loadAll();
         } catch (err) { toast(err.message); }
@@ -409,7 +409,7 @@
     $("checkin-accounts").querySelectorAll("[data-benefit]").forEach((button) => {
       button.addEventListener("click", async () => {
         try {
-          await api("/admin/benefit-claim", { method: "POST", body: JSON.stringify({ account_id: button.dataset.benefit }) });
+          await api("admin/benefit-claim", { method: "POST", body: JSON.stringify({ account_id: button.dataset.benefit }) });
           toast("权益领取已执行");
           await loadAll();
         } catch (err) { toast(err.message); }
@@ -419,7 +419,7 @@
 
   $("btn-checkin-all").addEventListener("click", async () => {
     try {
-      await api("/admin/checkin", { method: "POST", body: JSON.stringify({}) });
+      await api("admin/checkin", { method: "POST", body: JSON.stringify({}) });
       toast("已为全部启用账号签到");
       await loadAll();
     } catch (err) { toast(err.message); }
@@ -427,7 +427,7 @@
 
   $("btn-benefit-all").addEventListener("click", async () => {
     try {
-      await api("/admin/benefit-claim", { method: "POST", body: JSON.stringify({}) });
+      await api("admin/benefit-claim", { method: "POST", body: JSON.stringify({}) });
       toast("已为全部启用账号领取权益");
       await loadAll();
     } catch (err) { toast(err.message); }
@@ -488,7 +488,7 @@
     };
     if (form.api_key.value) payload.api_key = form.api_key.value;
     try {
-      const saved = await api("/admin/config", { method: "PUT", body: JSON.stringify(payload) });
+      const saved = await api("admin/config", { method: "PUT", body: JSON.stringify(payload) });
       if (payload.api_key) setKey(payload.api_key);
       fillSettings(saved);
       $("settings-message").textContent = "配置已保存，可立即生效的项已应用。";
@@ -500,12 +500,12 @@
   });
 
   async function loadAccounts() {
-    const data = await api("/admin/accounts");
+    const data = await api("admin/accounts");
     renderAccounts(data.accounts || []);
   }
 
   async function loadStatus() {
-    const data = await api("/admin/status");
+    const data = await api("admin/status");
     renderStatus(data);
     const enabled = data.pool ? data.pool.enabled : 0;
     const count = data.pool ? data.pool.count : 0;
@@ -514,7 +514,7 @@
   }
 
   async function loadSettings() {
-    const data = await api("/admin/config");
+    const data = await api("admin/config");
     fillSettings(data);
   }
 

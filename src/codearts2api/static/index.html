@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>codearts2api 控制台</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="static/styles.css">
 </head>
 <body>
   <div id="app">
@@ -27,9 +27,9 @@
         <div class="card login-card">
           <h2>登录控制台</h2>
           <p class="muted">输入网关 Bearer 密钥（环境变量 <code>CA2A_API_KEY</code>，或在此保存后的密钥）。密钥只保存在本机浏览器的 sessionStorage，不会放入 URL。</p>
-          <form id="login-form">
+          <form id="login-form" method="post">
             <label for="api-key">网关 API Key</label>
-            <input id="api-key" name="api_key" type="password" autocomplete="current-password" required placeholder="CA2A_API_KEY">
+            <input id="api-key" type="password" autocomplete="current-password" required placeholder="CA2A_API_KEY">
             <p id="login-error" class="error hidden"></p>
             <button type="submit" class="btn primary">进入控制台</button>
           </form>
@@ -202,6 +202,6 @@
   </dialog>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="/static/app.js"></script>
+  <script src="static/app.js"></script>
 </body>
 </html>

@@ -46,7 +46,6 @@ from codearts2api.schemas import AccountCreateRequest, AccountUpdateRequest, Cha
 
 logger = logging.getLogger(__name__)
 
-protected = APIRouter(dependencies=[Depends(require_api_key)])
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
@@ -175,6 +174,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     pool.load_or_migrate()
     refresh_logging(settings, pool)
     runtime = AppState(settings, pool)
+    # Per-app router: a module-level router accumulates routes on every factory call,
+    # which produces duplicate OpenAPI operations once more than one app is built.
+    protected = APIRouter(dependencies=[Depends(require_api_key)])
+    static_dir = Path(STATIC_DIR)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -245,20 +248,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         }
 
     def _ui_index() -> FileResponse:
-        index = STATIC_DIR / "index.html"
+        index = static_dir / "index.html"
         if not index.is_file():
             raise HTTPException(status_code=404, detail="WebUI is not packaged")
         return FileResponse(index, media_type="text/html; charset=utf-8")
 
-    @app.get("/", include_in_schema=False)
+    # Exact routes only: API, health, docs and /static keep their own handlers.
+    # HEAD is accepted so static hosts and health probes that send HEAD get the
+    # same response class instead of a 405.
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def ui_root() -> FileResponse:
-        # Exact route only: API, health, docs and /static keep their own handlers.
         return _ui_index()
 
-    @app.get("/ui", include_in_schema=False)
-    @app.get("/ui/", include_in_schema=False)
-    async def ui_page() -> RedirectResponse:
-        return RedirectResponse(url="/", status_code=307)
+    @app.api_route("/ui", methods=["GET", "HEAD"], include_in_schema=False)
+    @app.api_route("/ui/", methods=["GET", "HEAD"], include_in_schema=False)
+    async def ui_page(request: Request) -> RedirectResponse:
+        # Local-path Location: this app's own route plus the mount/root_path in scope.
+        # `request.url_for` resolves through the outer router and can pick a sibling
+        # mount when the same app is mounted twice.
+        prefix = request.scope.get("root_path", "").rstrip("/")
+        return RedirectResponse(url=f"{prefix}{app.url_path_for('ui_root')}", status_code=307)
 
     @protected.get("/v1/models")
     async def list_models(
@@ -653,8 +662,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return payload
 
     app.include_router(protected)
-    if STATIC_DIR.is_dir():
-        app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
     return app
 
 

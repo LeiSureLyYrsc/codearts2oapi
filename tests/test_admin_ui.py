@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+import warnings
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from codearts2api.app import create_app
@@ -34,6 +36,17 @@ def test_webui_routes_return_html(client: TestClient) -> None:
         assert "sessionStorage" in body or "sessionStorage" in client.get("/static/app.js").text
 
 
+def test_login_form_never_leaks_key_into_url(client: TestClient) -> None:
+    """With app.js blocked, an implicit GET submit must not serialize the key into the URL."""
+    html = client.get("/").text
+    form = html[html.index('id="login-form"'):]
+    form = form[: form.index("</form>")]
+    assert 'method="post"' in form
+    assert 'name="api_key"' not in form
+    # The script still reaches the field by id.
+    assert 'id="api-key"' in form
+    assert '$("api-key")' in client.get("/static/app.js").text
+
 
 @pytest.mark.parametrize("path", ["/ui", "/ui/"])
 def test_legacy_webui_redirects_to_root(client: TestClient, path: str) -> None:
@@ -46,13 +59,16 @@ def test_legacy_webui_redirects_to_root(client: TestClient, path: str) -> None:
 def test_root_assets_and_api_routes_are_not_shadowed(client: TestClient) -> None:
     response = client.get("/")
     assert not response.history
-    assets = re.findall(r'(?:src|href)="(/static/[^"?]+)"', response.text)
-    assert set(assets) == {"/static/styles.css", "/static/app.js"}
+    # Asset URLs must be page-relative so the UI works behind a proxy subpath.
+    assets = re.findall(r'(?:src|href)="(static/[^"?]+)"', response.text)
+    assert set(assets) == {"static/styles.css", "static/app.js"}
     for asset in assets:
-        loaded = client.get(asset)
+        loaded = client.get(response.url.join(asset))
         assert loaded.status_code == 200
         assert "text/html" not in loaded.headers["content-type"]
-    assert 'api("/admin/config"' in client.get("/static/app.js").text
+    script = client.get("/static/app.js").text
+    assert 'api("admin/config"' in script
+    assert 'api("/admin' not in script and 'api(`/admin' not in script
     for path in ("/healthz", "/readyz", "/openapi.json"):
         assert client.get(path).headers["content-type"].startswith("application/json")
     assert client.get("/docs").status_code == 200
@@ -62,11 +78,97 @@ def test_root_assets_and_api_routes_are_not_shadowed(client: TestClient) -> None
     assert client.get("/static/missing.js").status_code == 404
 
 
-def test_missing_webui_bundle_is_reported(client: TestClient, tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr("codearts2api.app.STATIC_DIR", tmp_path)
-    response = client.get("/")
-    assert response.status_code == 404
-    assert response.json()["detail"] == "WebUI is not packaged"
+@pytest.mark.parametrize("bundle_state", ["absent", "empty"])
+def test_missing_webui_bundle_is_reported(tmp_path, monkeypatch, settings: Settings, bundle_state: str) -> None:  # type: ignore[no-untyped-def]
+    # The bundle path is resolved at app creation, so build the app without one.
+    missing = tmp_path / "no-static"
+    if bundle_state == "empty":
+        missing.mkdir()
+    monkeypatch.setattr("codearts2api.app.STATIC_DIR", missing)
+    with TestClient(create_app(settings)) as client:
+        response = client.get("/")
+        assert response.status_code == 404
+        assert response.json()["detail"] == "WebUI is not packaged"
+        assert client.get("/static/app.js").status_code == 404
+
+
+def test_webui_head_requests_are_supported(client: TestClient) -> None:
+    root = client.head("/")
+    assert root.status_code == 200
+    assert root.headers["content-type"].startswith("text/html")
+    assert root.content == b""
+    for path in ("/ui", "/ui/"):
+        assert client.head(path, follow_redirects=False).status_code == 307
+    assert client.head("/static/app.js").status_code == 200
+
+
+def test_webui_works_behind_proxy_prefix(settings: Settings) -> None:
+    app = create_app(settings)
+    # root_path + prefixed base_url is the documented reverse-proxy pairing.
+    with TestClient(app, base_url="http://testserver/gateway", root_path="/gateway") as client:
+        page = client.get("/")
+        assert page.status_code == 200
+        assert page.request.url.path == "/gateway/"
+        assets = re.findall(r'(?:src|href)="(static/[^"?]+)"', page.text)
+        assert set(assets) == {"static/styles.css", "static/app.js"}
+        for asset in assets:
+            loaded = client.get(page.url.join(asset))
+            assert loaded.status_code == 200
+            assert loaded.request.url.path == f"/gateway/{asset}"
+        for path in ("/ui", "/ui/"):
+            redirect = client.get(path, follow_redirects=False)
+            assert redirect.status_code == 307
+            assert redirect.headers["location"] == "/gateway/"
+            assert client.get(f"http://testserver{redirect.headers['location']}").status_code == 200
+        assert client.get("/healthz").status_code == 200
+        assert client.get("/admin/config").status_code == 401
+        assert client.get("/admin/config", headers=AUTH).status_code == 200
+        assert client.get("/not-a-real-route").status_code == 404
+
+
+def test_redirect_is_local_to_each_mount(settings: Settings) -> None:
+    """A dual-mounted app must not resolve a sibling mount's root."""
+    mounted = create_app(settings)
+    outer = FastAPI()
+    outer.mount("/one", mounted)
+    outer.mount("/two", mounted)
+    with TestClient(outer) as client:
+        for prefix in ("/one", "/two"):
+            for path in ("/ui", "/ui/"):
+                redirect = client.get(f"{prefix}{path}", follow_redirects=False)
+                assert redirect.status_code == 307
+                assert redirect.headers["location"] == f"{prefix}/"
+                assert "http" not in redirect.headers["location"]
+                assert client.get(f"http://testserver{redirect.headers['location']}").status_code == 200
+
+
+def test_app_factory_does_not_share_router_state(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    def build(name: str):
+        return create_app(
+            Settings(
+                codearts_ak="test-ak",
+                codearts_sk="test-sk",
+                api_key="test-local-key",
+                scheduler_enabled=False,
+                checkin_run_on_startup=False,
+                data_dir=str(tmp_path / name / "data"),
+                auth_dir=str(tmp_path / name / "auths"),
+            )
+        )
+
+    first = build("first")
+    second = build("second")
+    # A shared module-level router re-registers every operation on the second
+    # factory call, which FastAPI reports when the schema is generated.
+    for app in (first, second):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            app.openapi()
+        assert [str(w.message) for w in caught if "Duplicate Operation ID" in str(w.message)] == []
+        with TestClient(app) as client:
+            assert client.get("/admin/config").status_code == 401
+            assert client.get("/admin/config", headers=AUTH).status_code == 200
+
 
 def test_admin_requires_api_key(client: TestClient) -> None:
     assert client.get("/admin/config").status_code == 401

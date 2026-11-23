@@ -115,10 +115,10 @@ https://snap-access.cn-north-4.myhuaweicloud.com
 
 ## 安装与启动
 
-需要 Python 3.12 与 [uv](https://docs.astral.sh/uv/)。
+需要 Python 3.12 与 [uv](https://docs.astral.sh/uv/)。WebUI 的 HTML、CSS 和 JavaScript 位于 `src/codearts2api/static/`，随 Python 包安装；不需要 Node.js、npm 或单独生成 `WebUI` 目录。
 
 ```bash
-cd codearts2api
+cd codearts2oapi
 uv sync
 cp .env.example .env
 # 编辑 .env，至少设置本地网关密钥 CA2A_API_KEY
@@ -151,6 +151,8 @@ uv run codearts2api serve --host 127.0.0.1 --port 8787
 - http://127.0.0.1:8787/ （WebUI 默认入口）
 - 旧链接 `/ui` 和 `/ui/` 会以 HTTP 307 重定向到 `/`。页面资源位于 `/static/`，管理 API 仍位于 `/admin/`，不会被页面路由覆盖。
 
+如果反向代理把网关发布在 `/gateway/` 之类的子路径下，请让代理转发时去掉 `/gateway`，并为 ASGI 服务配置同一个 `root_path`（例如 `uv run uvicorn codearts2api.app:app --port 8787 --root-path /gateway`）。浏览器应访问 `/gateway/`（保留末尾斜杠）；静态资源、管理 API 和旧 `/ui` 入口都会保留此前缀。
+
 页面本身不用带密钥；进入后在登录表单填写 `CA2A_API_KEY`，浏览器只把它存在 sessionStorage，并以 `Authorization: Bearer` 调用管理接口。在「账号池」里可以再添加第二个 AK/SK 或 OAuth 账号。OAuth 回调仍然是官方客户端同款的 `http://127.0.0.1:<port>/oauth/callback`，浏览器必须能访问这台机器的环回地址。
 
 其他命令：`uv run codearts2api status`（列出账号池，不输出密钥）、`uv run codearts2api logout`（可加 `--account`）。
@@ -174,9 +176,16 @@ docker compose pull
 docker compose up -d
 ```
 
-如果之前 `/ui` 或 `/` 无法打开，请先确认部署的是本仓库发布的 `ghcr.io/leisurelyyrsc/codearts2oapi:latest`，而不是旧的 `codearts2api` 镜像；更新 compose 后执行上面的 pull / up 命令重建容器。源码启动则更新代码后重启进程。若返回 `WebUI is not packaged`，说明部署产物缺少 `codearts2api/static/index.html`，需要重新构建/安装包含静态资源的完整包。
+如果之前 `/ui` 或 `/` 无法打开，请先确认部署的是本仓库发布的 `ghcr.io/leisurelyyrsc/codearts2oapi:latest`，而不是旧的 `codearts2api` 镜像；更新 compose 后执行上面的 pull / up 命令重建容器。源码启动则更新代码后重启进程。若 `/` 返回 `WebUI is not packaged`，请重装完整的 Python 包或重新构建镜像；若 `/` 返回页面但按钮不可用或没有样式，请检查同一访问前缀下的 `static/app.js` 和 `static/styles.css` 是否都能返回相应文件（不应是 404 或 HTML）。Docker 构建会校验已安装的这三个 WebUI 文件。
 
-首次拉取需要仓库里的 Actions 至少成功跑完一次。镜像随公开仓库发布；若 `docker compose pull` 返回 401，到 GitHub Packages 设置里确认 `codearts2oapi` 包已设为 public。`./data`（运行配置与每账号独立 Auth 文件）会挂载到容器中以保持持久化；`./auths` 挂载仅保留用于旧 OAuth 会话的兼容迁移。容器内的 OAuth 回调仍然指向容器自己的 127.0.0.1，通常需要在宿主机做端口转发，或在有浏览器的机器上用 CLI 登录，然后在 WebUI 导出 Auth 文件并在容器的 WebUI 导入。
+要在修复发布前用当前源码验证镜像，可以本地构建，并让 Compose 不拉取远程标签：
+
+```bash
+docker build -t ghcr.io/leisurelyyrsc/codearts2oapi:latest .
+docker compose up -d --pull never --force-recreate
+```
+
+首次拉取需要仓库里的 Actions 至少成功跑完一次。GHCR 包的可见性独立于仓库；若新发布的镜像无法匿名拉取，请由包管理员在 GitHub Packages 设置中将包设为 public。`./data`（运行配置与每账号独立 Auth 文件）会挂载到容器中以保持持久化；`./auths` 挂载仅保留用于旧 OAuth 会话的兼容迁移。容器内的 OAuth 回调仍然指向容器自己的 127.0.0.1，通常需要在宿主机做端口转发，或在有浏览器的机器上用 CLI 登录，然后在 WebUI 导出 Auth 文件并在容器的 WebUI 导入。
 
 ## 配置说明
 

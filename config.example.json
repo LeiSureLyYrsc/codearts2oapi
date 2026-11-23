@@ -5,7 +5,7 @@
     "checkin_cron": "0 8 * * *",
     "checkin_run_on_startup": true,
     "scheduler_enabled": true,
-    "campaign_type": "USER_LOGIN",
+    "campaign_type": "DAILY_CLAIM",
     "checkin_claim_all": false,
     "model_cache_ttl": 60,
     "snap_base_url": "https://snap-access.cn-north-4.myhuaweicloud.com",

@@ -238,6 +238,7 @@ def sign_request(
     project_id: str | None = None,
     sdk_date: str | None = None,
     extra_unsigned_headers: Mapping[str, str] | None = None,
+    sign_language: bool = False,
 ) -> SignedRequest:
     """Sign an HTTP request and return headers ready to send.
 
@@ -278,6 +279,8 @@ def sign_request(
         _set_header(hdrs, "X-Project-Id", project_id)
 
     unsigned = set(DEFAULT_UNSIGNED_HEADERS)
+    if sign_language:
+        unsigned.discard("x-language")
     if extra_unsigned_headers:
         unsigned.update(key.lower() for key in extra_unsigned_headers)
 

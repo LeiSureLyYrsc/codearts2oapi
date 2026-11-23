@@ -134,6 +134,73 @@
     }[ch]));
   }
 
+  // Probe results live only in this tab: the 「探测」 button is the single source
+  // of truth, so a page reload starts with no balances at all. Entries are
+  // { quota } on success and { error } on failure, so a failed probe always
+  // replaces the number it just invalidated.
+  const probeCache = new Map();
+
+  const QUOTA_UNITS = { credit: "积分", token: "Tokens" };
+
+  function formatAmount(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const num = Number(value);
+    if (!Number.isFinite(num)) return null;
+    const rounded = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(num);
+    // A small positive balance must not render as a flat "0".
+    if (num > 0 && Number(rounded.replace(/,/g, "")) === 0) {
+      return new Intl.NumberFormat("zh-CN", { maximumSignificantDigits: 3 }).format(num);
+    }
+    return rounded;
+  }
+
+  // Returns the balance sentence body, or "" when no usable number came back.
+  // A real 0 stays "剩余 0"; only a missing/unreadable balance is empty.
+  function quotaSummary(quota) {
+    if (!quota || typeof quota !== "object") return "";
+    const label = QUOTA_UNITS[quota.unit] || (quota.unit ? String(quota.unit) : "");
+    const suffix = label ? ` ${label}` : "";
+    const remaining = formatAmount(quota.remaining);
+    const total = formatAmount(quota.total);
+    const used = formatAmount(quota.used);
+    const expiring = formatAmount(quota.expiring);
+    const parts = [];
+    if (remaining !== null) parts.push(`剩余 ${remaining}${suffix}`);
+    if (total !== null) parts.push(`共 ${total}${suffix}`);
+    if (used !== null) parts.push(`已用 ${used}${suffix}`);
+    if (expiring !== null && Number(quota.expiring) > 0) parts.push(`即将过期 ${expiring}${suffix}`);
+    return parts.join(" · ");
+  }
+
+  function describeQuota(quota) {
+    const summary = quotaSummary(quota);
+    return summary ? `额度 ${summary}` : "额度不可用";
+  }
+
+  // `stale` marks a value that survived a table reload, so it reads as the last
+  // probe instead of a current balance.
+  function quotaCell(accountId, stale) {
+    const probe = probeCache.get(accountId);
+    if (!probe) return "";
+    if (probe.error) return `<div class="error">${escapeHtml(probe.error)}</div>`;
+    const prefix = stale ? "上次探测 · " : "";
+    return `<div class="muted">${escapeHtml(prefix + describeQuota(probe.quota))}</div>`;
+  }
+
+  // Update only the quota column so a probe never re-renders (and re-binds) the
+  // whole table, which would drop focus and scroll position mid-interaction.
+  // `freshId` is the account just probed; any other cached value stays "上次探测".
+  function refreshQuotaCells(freshId) {
+    const body = $("account-rows");
+    if (!body) return;
+    body.querySelectorAll("tr[data-id]").forEach((row) => {
+      const cell = row.querySelector("[data-quota]");
+      if (!cell) return;
+      const id = row.getAttribute("data-id");
+      cell.innerHTML = quotaCell(id, id !== freshId) || '<span class="muted">点「探测」查看额度</span>';
+    });
+  }
+
   function credentialLabel(account) {
     if (account.kind === "oauth") {
       const oauth = account.oauth || {};
@@ -147,7 +214,7 @@
   function renderAccounts(accounts) {
     const body = $("account-rows");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="7" class="muted">还没有账号。点击「连接 OAuth 账号」走华为云授权，或添加 AK/SK 账号、导入 Auth 文件。</td></tr>';
+      body.innerHTML = '<tr><td colspan="8" class="muted">还没有账号。点击「连接 OAuth 账号」走华为云授权，或添加 AK/SK 账号、导入 Auth 文件。</td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -156,6 +223,7 @@
         ? `<span class="pill warn">冷却至 ${escapeHtml(formatTime(account.cooldown_until))}</span>`
         : "";
       const err = account.last_error ? `<div class="error">${escapeHtml(account.last_error)}</div>` : "";
+      const quota = quotaCell(account.id, true);
       return `<tr data-id="${escapeHtml(account.id)}">
         <td><strong>${escapeHtml(account.name)}</strong><div class="muted">${escapeHtml(account.id)}</div></td>
         <td>${escapeHtml(account.kind)}</td>
@@ -163,6 +231,7 @@
         <td><label class="check"><input type="checkbox" class="toggle-enabled" ${account.enabled ? "checked" : ""}></label></td>
         <td>${statusPill(last.status)}<div class="muted">${escapeHtml(formatTime(account.last_checkin_at))}</div></td>
         <td>${cool || '<span class="pill ok">就绪</span>'}${err}</td>
+        <td data-quota>${quota || '<span class="muted">点「探测」查看额度</span>'}</td>
         <td class="row-actions">
           <button type="button" class="btn small" data-act="export">导出 Auth</button>
           <button type="button" class="btn small" data-act="edit">编辑</button>
@@ -216,13 +285,35 @@
       if (act === "delete") {
         if (!confirm(`确定删除账号「${account.name}」吗？此操作不可撤销。`)) return;
         await api(`admin/accounts/${account.id}`, { method: "DELETE" });
+        probeCache.delete(account.id);
         toast("账号已删除");
         await loadAll();
         return;
       }
       if (act === "test") {
-        const result = await api(`admin/accounts/${account.id}/test`, { method: "POST" });
-        toast(result.ok ? `探测成功：${result.account_type || "ok"}` : `探测失败：${result.message || "error"}`);
+        let result;
+        try {
+          result = await api(`admin/accounts/${encodeURIComponent(account.id)}/test`, { method: "POST" });
+        } catch (err) {
+          // A rejected probe (expired OAuth session, 400/404…) invalidates any
+          // balance shown earlier, so store the failure instead of the number.
+          const failure = `探测失败：${err.message || "请求失败"}`;
+          probeCache.set(account.id, { error: failure });
+          refreshQuotaCells(account.id);
+          toast(failure);
+          return;
+        }
+        if (result.ok) {
+          probeCache.set(account.id, { quota: result.quota });
+          refreshQuotaCells(account.id);
+          const summary = quotaSummary(result.quota);
+          toast(`探测成功：${result.account_type || "unknown"}${summary ? ` · 额度 ${summary}` : " · 额度不可用"}`);
+        } else {
+          const failure = `探测失败：${result.message || (result.http_status ? `HTTP ${result.http_status}` : "未知错误")}`;
+          probeCache.set(account.id, { error: failure });
+          refreshQuotaCells(account.id);
+          toast(failure);
+        }
         return;
       }
       if (act === "login") {
@@ -302,6 +393,8 @@
     try {
       if (id) {
         await api(`admin/accounts/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
+        // Rotated keys/session make an earlier probe result stale.
+        if (payload.ak || payload.sk || payload.security_token) probeCache.delete(id);
         toast("账号已更新");
       } else {
         await api("admin/accounts", { method: "POST", body: JSON.stringify(payload) });
@@ -557,6 +650,8 @@
     auth.finished = true;
     stopPolling();
     auth.loginId = null;
+    // New credentials invalidate any balance read with the old ones.
+    if (auth.accountId) probeCache.delete(auth.accountId);
     const name = (auth.draft && auth.draft.name) || "账号";
     setAuthStep("done");
     $("login-done-name").textContent = name;

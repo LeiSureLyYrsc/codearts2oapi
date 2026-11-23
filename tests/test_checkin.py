@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
+import httpx
 import pytest
 
 from codearts2api.checkin import (
@@ -16,6 +18,8 @@ from codearts2api.checkin import (
     run_checkin,
     select_campaigns,
 )
+from codearts2api.client import SnapAccessClient
+from codearts2api.credentials import ResolvedCredential
 
 
 class FakeTransport:
@@ -36,18 +40,18 @@ class FakeTransport:
     async def get_plugin_statistics(self) -> Any:
         return self.plugin
 
-    async def list_activities(self, channel: str = "IDE") -> Any:
-        assert channel == "IDE"
+    async def list_activities(self, channel: str = "DESKTOP") -> Any:
+        assert channel == "DESKTOP"
         return self.activities
 
-    async def claim_campaign(self, campaign_id: Any, channel: str = "IDE") -> tuple[Any, int]:
+    async def claim_campaign(self, campaign_id: Any, channel: str = "DESKTOP") -> tuple[Any, int]:
         self.claim_calls.append((campaign_id, channel))
         if isinstance(self.claim_result, Exception):
             raise self.claim_result
         return self.claim_result
 
-    async def confirm_campaign(self, campaign_id: Any) -> tuple[Any, int]:
-        self.confirm_calls.append(campaign_id)
+    async def confirm_campaign(self, user_benefit_id: Any) -> tuple[Any, int]:
+        self.confirm_calls.append(user_benefit_id)
         if isinstance(self.confirm_result, Exception):
             raise self.confirm_result
         return self.confirm_result
@@ -55,9 +59,9 @@ class FakeTransport:
 
 CREDIT = {"package": {"is_credit_package": True, "plan": "standard"}}
 TOKEN = {"package": {"is_credit_package": False}}
-USER_LOGIN = {
+DAILY = {
     "campaignId": "camp-login",
-    "type": "USER_LOGIN",
+    "type": "DAILY_CLAIM",
     "name": "每日签到得积分",
     "claimable": True,
     "status": "CLAIMABLE",
@@ -74,20 +78,21 @@ def test_credit_account_detection() -> None:
     assert is_credit_account({"package": {"is_credit_package": "true"}}) is False
 
 
-def test_select_campaigns_defaults_to_user_login() -> None:
+def test_select_campaigns_defaults_to_daily_claim() -> None:
     campaigns = extract_campaigns(
         {
             "data": [
-                USER_LOGIN,
+                DAILY,
+                {"campaignId": "login-event", "type": "USER_LOGIN", "claimable": True},
                 {"campaignId": "other", "type": "OTHER", "claimable": True},
             ]
         }
     )
-    selected = select_campaigns(campaigns, campaign_type="USER_LOGIN", all_claimable=False)
-    assert [c["campaignId"] for c in selected] == ["camp-login"]
+    assert select_campaigns(campaigns) == [DAILY]
+    assert select_campaigns(campaigns, campaign_type="USER_LOGIN") == [DAILY]
 
     all_claimable = select_campaigns(campaigns, campaign_type="USER_LOGIN", all_claimable=True)
-    assert {c["campaignId"] for c in all_claimable} == {"camp-login", "other"}
+    assert {c["campaignId"] for c in all_claimable} == {"camp-login", "login-event", "other"}
 
 
 def test_claimable_and_already_claimed_flags() -> None:
@@ -95,13 +100,16 @@ def test_claimable_and_already_claimed_flags() -> None:
     assert is_already_claimed({"status": "CLAIMED", "claimable": False}) is True
     assert is_claimable({"claimable": True}) is True
     assert is_claimable({"status": "CLAIMED"}) is False
+    assert is_claimable({"status": "CONFIRMED", "claimable": True}) is False
+    assert is_claimable({"status": "CONSUMED"}) is False
+    assert is_claimable({"status": "ELIGIBLE"}) is True
     assert is_claimable({"claimable": False, "status": "EXPIRED"}) is False
     assert is_already_claimed({"claimable": True, "status": "CLAIMABLE"}) is False
 
 
 @pytest.mark.asyncio
 async def test_ineligible_token_account_skips_claim() -> None:
-    transport = FakeTransport(plugin=TOKEN, activities={"data": [USER_LOGIN]})
+    transport = FakeTransport(plugin=TOKEN, activities={"data": [DAILY]})
     result = await run_checkin(transport)
     assert result.status == "ineligible"
     assert result.is_credit_package is False
@@ -112,7 +120,7 @@ async def test_ineligible_token_account_skips_claim() -> None:
 
 @pytest.mark.asyncio
 async def test_already_claimed_from_campaign_status() -> None:
-    campaign = {**USER_LOGIN, "claimable": False, "status": "CLAIMED"}
+    campaign = {**DAILY, "claimable": False, "status": "CLAIMED"}
     transport = FakeTransport(plugin=CREDIT, activities={"data": [campaign]})
     result = await run_checkin(transport)
     assert result.status == "already_claimed"
@@ -124,7 +132,7 @@ async def test_already_claimed_from_campaign_status() -> None:
 async def test_already_claimed_business_code_40001() -> None:
     transport = FakeTransport(
         plugin=CREDIT,
-        activities={"data": [USER_LOGIN]},
+        activities={"data": [DAILY]},
         claim_result=({"code": "40001", "message": "already claimed"}, 200),
     )
     result = await run_checkin(transport)
@@ -137,7 +145,7 @@ async def test_already_claimed_business_code_40001() -> None:
 async def test_activity_missing_40401() -> None:
     transport = FakeTransport(
         plugin=CREDIT,
-        activities={"data": [USER_LOGIN]},
+        activities={"data": [DAILY]},
         claim_result=({"error_code": "40401"}, 404),
     )
     result = await run_checkin(transport)
@@ -150,14 +158,14 @@ async def test_activity_missing_40401() -> None:
 async def test_claim_and_confirm_when_id_is_not_null() -> None:
     transport = FakeTransport(
         plugin=CREDIT,
-        activities={"data": [USER_LOGIN]},
+        activities={"data": [DAILY]},
         claim_result=({"id": "record-1", "campaignId": "camp-login"}, 200),
         confirm_result=({"ok": True}, 200),
     )
     result = await run_checkin(transport)
     assert result.status == "claimed"
-    assert transport.claim_calls == [("camp-login", "IDE")]
-    assert transport.confirm_calls == ["camp-login"]
+    assert transport.claim_calls == [("camp-login", "DESKTOP")]
+    assert transport.confirm_calls == ["record-1"]
     assert result.actions[0].needs_confirm is True
     assert result.actions[0].confirmed is True
 
@@ -166,13 +174,13 @@ async def test_claim_and_confirm_when_id_is_not_null() -> None:
 async def test_claim_without_confirm_when_id_is_null() -> None:
     transport = FakeTransport(
         plugin=CREDIT,
-        activities={"data": [USER_LOGIN]},
+        activities={"data": [DAILY]},
         claim_result=({"id": None}, 200),
         confirm_result=({"ok": True}, 200),
     )
     result = await run_checkin(transport)
     assert result.status == "claimed"
-    assert transport.claim_calls == [("camp-login", "IDE")]
+    assert transport.claim_calls == [("camp-login", "DESKTOP")]
     assert transport.confirm_calls == []
     assert result.actions[0].needs_confirm is False
     assert result.actions[0].confirmed is False
@@ -182,7 +190,7 @@ async def test_claim_without_confirm_when_id_is_null() -> None:
 async def test_confirm_failure_is_reported() -> None:
     transport = FakeTransport(
         plugin=CREDIT,
-        activities={"data": [USER_LOGIN]},
+        activities={"data": [DAILY]},
         claim_result=({"id": "record-1"}, 200),
         confirm_result=RuntimeError("timeout"),
     )
@@ -197,7 +205,7 @@ async def test_claim_all_claimable_processes_multiple() -> None:
     other = {"campaignId": "bonus", "type": "BONUS", "claimable": True}
     transport = FakeTransport(
         plugin=CREDIT,
-        activities={"data": [USER_LOGIN, other]},
+        activities={"data": [DAILY, other]},
         claim_result=({"id": None}, 200),
     )
     result = await run_checkin(transport, all_claimable=True)
@@ -211,3 +219,67 @@ def test_interpret_claim_id_in_wrapper() -> None:
     assert interpretation.claim_record_id == "x"
     interpretation_null = interpret_claim_response({"data": {"id": None}}, 200)
     assert interpretation_null.needs_confirm is False
+
+
+@pytest.mark.parametrize("stage", ["delivery", "claim", "confirm"])
+async def test_business_error_in_http_200_is_not_success(stage):
+    rejected = {"code": "NO_ACCESS", "message": "not allowed", "data": None}
+    transport = FakeTransport(
+        plugin=CREDIT,
+        activities=rejected if stage == "delivery" else {"code": 0, "data": {"items": [DAILY]}},
+        claim_result=(rejected if stage == "claim" else {"data": {"userBenefitId": "receipt"}}, 200),
+        confirm_result=(rejected, 200),
+    )
+    result = await run_checkin(transport)
+    assert result.status == ("confirm_failed" if stage == "confirm" else "error")
+    assert transport.confirm_calls == (["receipt"] if stage == "confirm" else [])
+    if stage == "delivery":
+        assert transport.claim_calls == []
+
+
+async def test_checkin_signed_desktop_contract_with_cli_oauth_credentials(settings):
+    calls = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        headers = request.headers
+        assert headers["Content-Type"] == "application/json"
+        assert headers["X-Security-Token"] == "cli-sts"
+        assert "Access=cli-ak," in headers["Authorization"]
+        signed = headers["Authorization"].split("SignedHeaders=", 1)[1].split(",", 1)[0].split(";")
+        assert {"content-type", "x-security-token"} <= set(signed)
+        if request.url.path == "/snap-manager/v1/statistics/plugin":
+            assert request.method == "GET"
+            assert "Agent-Type" not in headers
+            return httpx.Response(200, json=CREDIT)
+
+        assert headers["Agent-Type"] == "PromptCenter"
+        assert headers["X-Language"] == "zh-cn"
+        assert {"agent-type", "x-language"} <= set(signed)
+        if request.url.path == "/v1/ops/delivery":
+            assert request.method == "GET"
+            assert request.url.params["channel"] == "DESKTOP"
+            assert headers["x-snap-traceid"]
+            assert "x-snap-traceid" in signed
+            return httpx.Response(200, json={"code": 0, "data": {"items": [
+                {"campaignId": 12, "type": "daily_claim", "status": "ELIGIBLE"},
+                {"campaignId": 13, "type": "USER_LOGIN", "status": "ELIGIBLE"},
+            ]}})
+
+        assert request.method == "POST"
+        body = json.loads(request.content)
+        if request.url.path == "/v1/ops/claim":
+            assert body.pop("idempotentKey").startswith("claim_")
+            assert body == {"campaignId": 12, "channel": "DESKTOP"}
+            return httpx.Response(200, json={"code": 0, "data": {"userBenefitId": 99}})
+        assert request.url.path == "/v1/ops/confirm"
+        assert body == {"userBenefitId": 99}
+        return httpx.Response(200, json={"code": 0, "data": None})
+
+    credential = ResolvedCredential("cli-ak", "cli-sk", "cli-sts", "oauth")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as http:
+        result = await run_checkin(SnapAccessClient(settings, http).bind(credential), campaign_type="USER_LOGIN")
+
+    assert result.status == "claimed"
+    assert result.actions[0].confirmed is True
+    assert calls == ["/snap-manager/v1/statistics/plugin", "/v1/ops/delivery", "/v1/ops/claim", "/v1/ops/confirm"]

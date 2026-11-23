@@ -605,6 +605,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.exception("OAuth login commit failed login_id=%s", attempt.login_id)
             return
         _retire_login(runtime, attempt, status="logged_in", message=None, account_id=account_id)
+        runtime.model_cache.clear()
         refresh_logging(runtime.settings, runtime.pool)
         logger.info("OAuth login completed login_id=%s account_id=%s", attempt.login_id, account_id)
 

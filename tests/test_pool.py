@@ -208,7 +208,7 @@ class RecordingTransport:
             "data": [
                 {
                     "campaignId": f"camp-{self.account_name}",
-                    "type": "USER_LOGIN",
+                    "type": "DAILY_CLAIM",
                     "claimable": True,
                     "status": "CLAIMABLE",
                 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Any
 from urllib.parse import urlencode, urljoin
 
@@ -22,6 +23,7 @@ DELIVERY_PATH = "/v1/ops/delivery"
 CLAIM_PATH = "/v1/ops/claim"
 CONFIRM_PATH = "/v1/ops/confirm"
 BENEFIT_CLAIM_PATH = "/api/v1/benefit/claim"
+CHECKIN_CHANNEL = "DESKTOP"
 
 
 def json_body(payload: Any) -> bytes:
@@ -79,13 +81,15 @@ class SnapAccessClient:
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
         credential: ResolvedCredential | None = None,
+        *,
+        sign_language: bool = False,
     ) -> dict[str, str]:
         cred = self._credential(credential)
         outgoing = dict(headers or {})
-        if body and "Content-Type" not in {k.title() for k in outgoing} and not any(
-            k.lower() == "content-type" for k in outgoing
-        ):
+        if body and not any(k.lower() == "content-type" for k in outgoing):
             outgoing["Content-Type"] = "application/json"
+        if sign_language:
+            outgoing["X-Language"] = self._settings.x_language or "zh-cn"
         project_id = cred.project_id if cred.project_id is not None else self._settings.codearts_project_id
         signed = sign_request(
             method=method,
@@ -96,7 +100,8 @@ class SnapAccessClient:
             body=body,
             security_token=cred.security_token,
             project_id=project_id,
-            extra_unsigned_headers=self._unsigned_headers(),
+            extra_unsigned_headers=None if sign_language else self._unsigned_headers(),
+            sign_language=sign_language,
         )
         return signed.headers
 
@@ -110,18 +115,20 @@ class SnapAccessClient:
         body: bytes | None = None,
         expected: tuple[int, ...] = (200, 201),
         credential: ResolvedCredential | None = None,
+        headers: dict[str, str] | None = None,
+        sign_language: bool = False,
     ) -> tuple[Any, int]:
         if body is None and payload is not None:
             body = json_body(payload)
         url = self._build_url(path, query)
         cred = self._credential(credential)
-        headers = self.sign(method, url, body=body, credential=cred)
+        signed = self.sign(method, url, body=body, headers=headers, credential=cred, sign_language=sign_language)
         label = cred.account_id or cred.source
         logger.info("upstream %s %s account=%s", method.upper(), path, label)
         response = await self._http.request(
             method.upper(),
             url,
-            headers=headers,
+            headers=signed,
             content=body if body is not None else None,
         )
         parsed = _parse_body(response)
@@ -131,18 +138,28 @@ class SnapAccessClient:
         return parsed, response.status_code
 
     async def get_plugin_statistics(self, credential: ResolvedCredential | None = None) -> Any:
-        payload, _status = await self.request_json("GET", PLUGIN_STATISTICS_PATH, credential=credential)
+        payload, _status = await self.request_json(
+            "GET", PLUGIN_STATISTICS_PATH, headers={"Content-Type": "application/json"}, credential=credential,
+        )
         return payload
+
+    @staticmethod
+    def _prompt_center_headers() -> dict[str, str]:
+        return {"Agent-Type": "PromptCenter", "Content-Type": "application/json"}
 
     async def list_builtin_models(self, credential: ResolvedCredential | None = None) -> Any:
-        payload, _status = await self.request_json("GET", MODELS_PATH, credential=credential)
+        payload, _status = await self.request_json(
+            "GET", MODELS_PATH, headers=self._prompt_center_headers(), sign_language=True, credential=credential,
+        )
         return payload
 
-    async def list_activities(self, channel: str = "IDE", credential: ResolvedCredential | None = None) -> Any:
+    async def list_activities(self, channel: str = CHECKIN_CHANNEL, credential: ResolvedCredential | None = None) -> Any:
         payload, _status = await self.request_json(
             "GET",
             DELIVERY_PATH,
             query={"channel": channel},
+            headers={**self._prompt_center_headers(), "x-snap-traceid": str(uuid.uuid4())},
+            sign_language=True,
             credential=credential,
         )
         return payload
@@ -150,27 +167,31 @@ class SnapAccessClient:
     async def claim_campaign(
         self,
         campaign_id: Any,
-        channel: str = "IDE",
+        channel: str = CHECKIN_CHANNEL,
         credential: ResolvedCredential | None = None,
     ) -> tuple[Any, int]:
         return await self.request_json(
             "POST",
             CLAIM_PATH,
-            payload={"campaignId": campaign_id, "channel": channel},
-            expected=tuple(range(200, 500)),
+            payload={"campaignId": campaign_id, "idempotentKey": f"claim_{uuid.uuid4().hex}", "channel": channel},
+            expected=tuple(range(200, 300)) + tuple(range(400, 500)),
+            headers=self._prompt_center_headers(),
+            sign_language=True,
             credential=credential,
         )
 
     async def confirm_campaign(
         self,
-        campaign_id: Any,
+        user_benefit_id: Any,
         credential: ResolvedCredential | None = None,
     ) -> tuple[Any, int]:
         return await self.request_json(
             "POST",
             CONFIRM_PATH,
-            payload={"campaignId": campaign_id},
-            expected=tuple(range(200, 500)),
+            payload={"userBenefitId": user_benefit_id},
+            expected=tuple(range(200, 300)) + tuple(range(400, 500)),
+            headers=self._prompt_center_headers(),
+            sign_language=True,
             credential=credential,
         )
 
@@ -203,8 +224,6 @@ class SnapAccessClient:
         with an empty JSON object, SDK-HMAC-SHA256, optional X-Security-Token,
         and treats error_code == "0000" as success.
         """
-        import uuid
-
         base = self._settings.opengw_base_url
         if not base:
             return {
@@ -240,14 +259,14 @@ class BoundSnapClient:
     async def get_plugin_statistics(self) -> Any:
         return await self._client.get_plugin_statistics(credential=self._credential)
 
-    async def list_activities(self, channel: str = "IDE") -> Any:
+    async def list_activities(self, channel: str = CHECKIN_CHANNEL) -> Any:
         return await self._client.list_activities(channel=channel, credential=self._credential)
 
-    async def claim_campaign(self, campaign_id: Any, channel: str = "IDE") -> tuple[Any, int]:
+    async def claim_campaign(self, campaign_id: Any, channel: str = CHECKIN_CHANNEL) -> tuple[Any, int]:
         return await self._client.claim_campaign(campaign_id, channel=channel, credential=self._credential)
 
-    async def confirm_campaign(self, campaign_id: Any) -> tuple[Any, int]:
-        return await self._client.confirm_campaign(campaign_id, credential=self._credential)
+    async def confirm_campaign(self, user_benefit_id: Any) -> tuple[Any, int]:
+        return await self._client.confirm_campaign(user_benefit_id, credential=self._credential)
 
     async def claim_opengw_benefit(self) -> dict[str, Any]:
         return await self._client.claim_opengw_benefit(credential=self._credential)

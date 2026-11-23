@@ -1,6 +1,6 @@
 services:
   codearts2api:
-    image: ghcr.io/leisurelyyrsc/codearts2api:latest
+    image: ghcr.io/leisurelyyrsc/codearts2oapi:latest
     pull_policy: always
     container_name: codearts2api
     ports:

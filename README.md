@@ -148,7 +148,8 @@ uv run codearts2api serve --host 127.0.0.1 --port 8787
 
 默认监听 `127.0.0.1:8787`。浏览器打开控制台：
 
-- http://127.0.0.1:8787/ 或 http://127.0.0.1:8787/ui
+- http://127.0.0.1:8787/ （WebUI 默认入口）
+- 旧链接 `/ui` 和 `/ui/` 会以 HTTP 307 重定向到 `/`。页面资源位于 `/static/`，管理 API 仍位于 `/admin/`，不会被页面路由覆盖。
 
 页面本身不用带密钥；进入后在登录表单填写 `CA2A_API_KEY`，浏览器只把它存在 sessionStorage，并以 `Authorization: Bearer` 调用管理接口。在「账号池」里可以再添加第二个 AK/SK 或 OAuth 账号。OAuth 回调仍然是官方客户端同款的 `http://127.0.0.1:<port>/oauth/callback`，浏览器必须能访问这台机器的环回地址。
 
@@ -162,7 +163,7 @@ uv run pytest
 
 镜像由 GitHub Actions 在推送到 `main` 或手动触发工作流时构建，并发布到 GitHub Container Registry：
 
-[`ghcr.io/leisurelyyrsc/codearts2api:latest`](https://github.com/LeiSureLyYrsc/codearts2api/pkgs/container/codearts2api)
+[`ghcr.io/leisurelyyrsc/codearts2oapi:latest`](https://github.com/LeiSureLyYrsc/codearts2oapi/pkgs/container/codearts2oapi)
 
 `docker-compose.yml` 已指向该 `latest` 标签。先复制 `.env.example` 为 `.env`，**必须**设置 `CA2A_API_KEY`。启动时自动创建 `data/config.json`，只保存定时签到等运行配置；AK/SK 或 OAuth 认证保存在 `data/accounts/` 的每账号独立文件中。先启动，再在 WebUI 添加或导入账号即可。容器监听 `0.0.0.0:8787`，默认只映射到宿主机的 `127.0.0.1:8787`。控制台在 http://127.0.0.1:8787/ 。
 
@@ -173,7 +174,9 @@ docker compose pull
 docker compose up -d
 ```
 
-首次拉取需要仓库里的 Actions 至少成功跑完一次。镜像随公开仓库发布；若 `docker compose pull` 返回 401，到 GitHub Packages 设置里确认 `codearts2api` 包已设为 public。`./data`（运行配置与每账号独立 Auth 文件）会挂载到容器中以保持持久化；`./auths` 挂载仅保留用于旧 OAuth 会话的兼容迁移。容器内的 OAuth 回调仍然指向容器自己的 127.0.0.1，通常需要在宿主机做端口转发，或在有浏览器的机器上用 CLI 登录，然后在 WebUI 导出 Auth 文件并在容器的 WebUI 导入。
+如果之前 `/ui` 或 `/` 无法打开，请先确认部署的是本仓库发布的 `ghcr.io/leisurelyyrsc/codearts2oapi:latest`，而不是旧的 `codearts2api` 镜像；更新 compose 后执行上面的 pull / up 命令重建容器。源码启动则更新代码后重启进程。若返回 `WebUI is not packaged`，说明部署产物缺少 `codearts2api/static/index.html`，需要重新构建/安装包含静态资源的完整包。
+
+首次拉取需要仓库里的 Actions 至少成功跑完一次。镜像随公开仓库发布；若 `docker compose pull` 返回 401，到 GitHub Packages 设置里确认 `codearts2oapi` 包已设为 public。`./data`（运行配置与每账号独立 Auth 文件）会挂载到容器中以保持持久化；`./auths` 挂载仅保留用于旧 OAuth 会话的兼容迁移。容器内的 OAuth 回调仍然指向容器自己的 127.0.0.1，通常需要在宿主机做端口转发，或在有浏览器的机器上用 CLI 登录，然后在 WebUI 导出 Auth 文件并在容器的 WebUI 导入。
 
 ## 配置说明
 

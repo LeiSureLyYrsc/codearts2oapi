@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -32,6 +33,40 @@ def test_webui_routes_return_html(client: TestClient) -> None:
         assert "CA2A_API_KEY" in body
         assert "sessionStorage" in body or "sessionStorage" in client.get("/static/app.js").text
 
+
+
+@pytest.mark.parametrize("path", ["/ui", "/ui/"])
+def test_legacy_webui_redirects_to_root(client: TestClient, path: str) -> None:
+    response = client.get(path, follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "/"
+    assert client.get(path).url.path == "/"
+
+
+def test_root_assets_and_api_routes_are_not_shadowed(client: TestClient) -> None:
+    response = client.get("/")
+    assert not response.history
+    assets = re.findall(r'(?:src|href)="(/static/[^"?]+)"', response.text)
+    assert set(assets) == {"/static/styles.css", "/static/app.js"}
+    for asset in assets:
+        loaded = client.get(asset)
+        assert loaded.status_code == 200
+        assert "text/html" not in loaded.headers["content-type"]
+    assert 'api("/admin/config"' in client.get("/static/app.js").text
+    for path in ("/healthz", "/readyz", "/openapi.json"):
+        assert client.get(path).headers["content-type"].startswith("application/json")
+    assert client.get("/docs").status_code == 200
+    for path in ("/v1/models", "/admin/config", "/admin/accounts"):
+        assert client.get(path).status_code == 401
+    assert client.get("/not-a-real-route").status_code == 404
+    assert client.get("/static/missing.js").status_code == 404
+
+
+def test_missing_webui_bundle_is_reported(client: TestClient, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("codearts2api.app.STATIC_DIR", tmp_path)
+    response = client.get("/")
+    assert response.status_code == 404
+    assert response.json()["detail"] == "WebUI is not packaged"
 
 def test_admin_requires_api_key(client: TestClient) -> None:
     assert client.get("/admin/config").status_code == 401

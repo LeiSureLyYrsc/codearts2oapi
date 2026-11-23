@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from codearts2api.account_files import account_filename
 from fastapi.staticfiles import StaticFiles
 
@@ -250,13 +250,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="WebUI is not packaged")
         return FileResponse(index, media_type="text/html; charset=utf-8")
 
-    @app.get("/")
+    @app.get("/", include_in_schema=False)
     async def ui_root() -> FileResponse:
+        # Exact route only: API, health, docs and /static keep their own handlers.
         return _ui_index()
 
-    @app.get("/ui")
-    async def ui_page() -> FileResponse:
-        return _ui_index()
+    @app.get("/ui", include_in_schema=False)
+    @app.get("/ui/", include_in_schema=False)
+    async def ui_page() -> RedirectResponse:
+        return RedirectResponse(url="/", status_code=307)
 
     @protected.get("/v1/models")
     async def list_models(

@@ -1,6 +1,6 @@
-"""Official daily check-in (USER_LOGIN) state machine and orchestrator.
+"""Official daily check-in (DAILY_CLAIM) state machine and orchestrator.
 
-Official activity 「每日签到得积分」 uses campaign type USER_LOGIN and is
+Official activity 「每日签到得积分」 uses campaign type DAILY_CLAIM and is
 reported as running 2026-10-27 20:00 through 2026-12-31 23:59:59
 Asia/Shanghai. Amounts depend on the plan (experience 100, standard 150,
 premium/flagship 200) and are valid for that day only.
@@ -9,9 +9,9 @@ The public API catalog does not document these endpoints. They go through
 the official-client snap-access gateway:
 
 - GET  /snap-manager/v1/statistics/plugin   (account / package)
-- GET  /v1/ops/delivery?channel=IDE
-- POST /v1/ops/claim   {"campaignId": <id>, "channel": "IDE"}
-- POST /v1/ops/confirm {"campaignId": <id>}
+- GET  /v1/ops/delivery?channel=DESKTOP
+- POST /v1/ops/claim   {"campaignId": <id>, "idempotentKey": <key>, "channel": "DESKTOP"}
+- POST /v1/ops/confirm {"userBenefitId": <claim record id>}
 
 Daily check-in is only for credit-billing accounts
 (``package.is_credit_package is True``). Token-billing accounts are skipped.
@@ -31,14 +31,19 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from codearts2api.client import CHECKIN_CHANNEL, UpstreamError
+
 logger = logging.getLogger(__name__)
 
+DAILY_CAMPAIGN_TYPE = "DAILY_CLAIM"
 ALREADY_CLAIMED_CODES = frozenset({"40001", "E40001"})
 ACTIVITY_MISSING_CODES = frozenset({"40401", "E40401"})
 
 CLAIMED_STATUSES = frozenset(
     {
         "CLAIMED",
+        "CONFIRMED",
+        "CONSUMED",
         "ALREADY_CLAIMED",
         "RECEIVED",
         "DONE",
@@ -51,6 +56,7 @@ CLAIMED_STATUSES = frozenset(
 CLAIMABLE_STATUSES = frozenset(
     {
         "CLAIMABLE",
+        "ELIGIBLE",
         "AVAILABLE",
         "INIT",
         "UNCLAIMED",
@@ -64,11 +70,11 @@ CLAIMABLE_STATUSES = frozenset(
 class CheckinTransport(Protocol):
     async def get_plugin_statistics(self) -> Any: ...
 
-    async def list_activities(self, channel: str = "IDE") -> Any: ...
+    async def list_activities(self, channel: str = CHECKIN_CHANNEL) -> Any: ...
 
-    async def claim_campaign(self, campaign_id: Any, channel: str = "IDE") -> tuple[Any, int]: ...
+    async def claim_campaign(self, campaign_id: Any, channel: str = CHECKIN_CHANNEL) -> tuple[Any, int]: ...
 
-    async def confirm_campaign(self, campaign_id: Any) -> tuple[Any, int]: ...
+    async def confirm_campaign(self, user_benefit_id: Any) -> tuple[Any, int]: ...
 
 
 @dataclass(slots=True)
@@ -193,8 +199,6 @@ def campaign_name_of(campaign: dict[str, Any]) -> str | None:
 def is_already_claimed(campaign: dict[str, Any]) -> bool:
     if campaign.get("claimed") is True or campaign.get("already_claimed") is True:
         return True
-    if campaign.get("claimable") is True:
-        return False
     status = str(campaign.get("status") or "").upper()
     return status in CLAIMED_STATUSES
 
@@ -209,7 +213,7 @@ def is_claimable(campaign: dict[str, Any]) -> bool:
         return True
     if "claimable" not in campaign and not status:
         # Official client pre-checks claimable/status. If both are absent we
-        # still allow an attempt so a USER_LOGIN campaign is not silently dropped.
+        # still allow an attempt so a daily campaign is not silently dropped.
         return True
     return False
 
@@ -217,11 +221,14 @@ def is_claimable(campaign: dict[str, Any]) -> bool:
 def select_campaigns(
     campaigns: list[dict[str, Any]],
     *,
-    campaign_type: str = "USER_LOGIN",
+    campaign_type: str = DAILY_CAMPAIGN_TYPE,
     all_claimable: bool = False,
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
+    requested_type = campaign_type.strip().upper()
+    if requested_type == "USER_LOGIN":
+        requested_type = DAILY_CAMPAIGN_TYPE  # previous default, not the separate desktop login activity
     for campaign in campaigns:
         cid = campaign_id_of(campaign)
         key = str(cid) if cid is not None else repr(campaign)
@@ -232,7 +239,7 @@ def select_campaigns(
             if not is_claimable(campaign) and not is_already_claimed(campaign):
                 continue
         else:
-            if typ != campaign_type:
+            if not typ or typ.upper() != requested_type:
                 continue
         seen.add(key)
         selected.append(campaign)
@@ -271,13 +278,23 @@ def extract_business_code(payload: Any) -> str | None:
 def extract_claim_record_id(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return None
-    if "id" in payload:
-        return payload.get("id")
-    for wrapper in ("data", "result"):
-        inner = payload.get(wrapper)
-        if isinstance(inner, dict) and "id" in inner:
-            return inner.get("id")
+    for body in (payload.get("data"), payload.get("result"), payload):
+        if not isinstance(body, dict):
+            continue
+        for key in ("id", "userBenefitId"):
+            record_id = body.get(key)
+            if (type(record_id) is int and record_id > 0) or (isinstance(record_id, str) and record_id.strip()):
+                return record_id
     return None
+
+
+def _business_error(payload: Any, code: str) -> str:
+    if isinstance(payload, dict):
+        for key in ("message", "error_msg", "errorMsg", "msg"):
+            message = payload.get(key)
+            if isinstance(message, str) and message:
+                return message
+    return f"upstream business code {code}"
 
 
 @dataclass(slots=True)
@@ -315,6 +332,13 @@ def interpret_claim_response(payload: Any, http_status: int | None = None) -> Cl
             claim_record_id=record_id,
             message=f"Claim failed with HTTP {http_status}",
         )
+    if code is not None:
+        return ClaimInterpretation(
+            status="error", needs_confirm=False, business_code=code,
+            message=f"Claim failed: {_business_error(payload, code)}",
+        )
+    if not isinstance(payload, dict) and http_status != 204:
+        return ClaimInterpretation(status="error", needs_confirm=False, message="Unexpected claim response")
     if record_id is not None:
         return ClaimInterpretation(
             status="claimed",
@@ -347,12 +371,15 @@ def _http_status_from_exc(exc: BaseException) -> int | None:
 async def run_checkin(
     transport: CheckinTransport,
     *,
-    campaign_type: str = "USER_LOGIN",
+    campaign_type: str = DAILY_CAMPAIGN_TYPE,
     all_claimable: bool = False,
 ) -> CheckinResult:
-    """Run the official 3-step check-in flow. Safe to call repeatedly."""
+    """Run the desktop daily claim flow, skipping already claimed campaigns."""
     try:
         plugin = await transport.get_plugin_statistics()
+        package_code = extract_business_code(plugin) if extract_package(plugin) is None else None
+        if package_code is not None:
+            raise UpstreamError(_business_error(plugin, package_code), 200)
     except Exception as exc:  # noqa: BLE001 — surface any transport failure
         logger.exception("Failed to load plugin statistics")
         return CheckinResult(
@@ -377,7 +404,10 @@ async def run_checkin(
         )
 
     try:
-        delivery = await transport.list_activities(channel="IDE")
+        delivery = await transport.list_activities(channel=CHECKIN_CHANNEL)
+        delivery_code = extract_business_code(delivery)
+        if delivery_code is not None:
+            raise UpstreamError(_business_error(delivery, delivery_code), 200)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to list check-in activities")
         return CheckinResult(
@@ -449,7 +479,7 @@ async def _process_campaign(
         )
 
     try:
-        payload, http_status = await transport.claim_campaign(cid, channel="IDE")
+        payload, http_status = await transport.claim_campaign(cid, channel=CHECKIN_CHANNEL)
     except Exception as exc:  # noqa: BLE001
         # Some gateways raise on 4xx even when the body carries a business code.
         body = _exc_payload(exc)
@@ -488,7 +518,7 @@ async def _process_campaign(
         return action
 
     try:
-        confirm_payload, confirm_status = await transport.confirm_campaign(cid)
+        confirm_payload, confirm_status = await transport.confirm_campaign(interpretation.claim_record_id)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Confirm request failed for campaign %s", cid)
         action.status = "confirm_failed"
@@ -510,10 +540,11 @@ async def _process_campaign(
         return action
 
     confirm_code = extract_business_code(confirm_payload)
-    if confirm_code in ACTIVITY_MISSING_CODES:
+    if confirm_code is not None or (not isinstance(confirm_payload, dict) and confirm_status != 204):
         action.status = "confirm_failed"
         action.business_code = confirm_code
-        action.message = "Claim succeeded but confirm reported activity missing (40401)"
+        reason = _business_error(confirm_payload, confirm_code) if confirm_code is not None else "unexpected response"
+        action.message = f"Claim succeeded but confirm failed: {reason}; credits may stay pending."
         return action
 
     action.confirmed = True
@@ -523,6 +554,8 @@ async def _process_campaign(
 
 
 def _exc_payload(exc: BaseException) -> Any | None:
+    if isinstance(exc, UpstreamError):
+        return exc.payload
     response = getattr(exc, "response", None)
     if response is None:
         return None

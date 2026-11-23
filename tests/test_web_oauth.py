@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from codearts2api import app as app_module, pool
 from codearts2api.app import create_app
+from codearts2api.client import SnapAccessClient
 from codearts2api.oauth import flow
 from codearts2api.oauth.pkce import sha256_b64url
 from codearts2api.oauth.session import OAuthSession
@@ -115,6 +116,60 @@ def test_manual_code_adds_account_only_after_exchange(client, tmp_path, monkeypa
         restored = next(account for account in _accounts(restarted) if account["id"] == new_id)
         assert restored["oauth"]["has_refresh_token"] is True
         assert restored["enabled"] is False
+
+
+def test_new_oauth_account_can_read_models_and_credit_quota(client, monkeypatch):
+    runtime = client.app.state.runtime
+    runtime.model_cache.set([])
+    for account in _accounts(client):
+        disabled = client.patch(f"/admin/accounts/{account['id']}", headers=AUTH, json={"enabled": False})
+        assert disabled.status_code == 200
+
+    monkeypatch.setattr(
+        flow,
+        "exchange_authorization_code",
+        lambda _endpoints, **_: OAuthSession("oauth-test-ak", "oauth-test-sk", security_token="test-sts-token"),
+    )
+    login = _start(client)
+    submitted = _submit(client, login, f"{login['callback_url']}?code=mock-code")
+    assert submitted.status_code == 200
+    settled = _settled(client, login)
+    assert settled["status"] == "logged_in", settled
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.headers["X-Security-Token"] == "test-sts-token"
+        assert "Access=oauth-test-ak," in request.headers["Authorization"]
+        assert request.headers["Content-Type"] == "application/json"
+        if request.url.path == "/v1/model/builtin":
+            assert request.headers["Agent-Type"] == "PromptCenter"
+            assert request.headers["X-Language"] == "zh-cn"
+            return httpx.Response(200, json={
+                "builtinModels": [{"model_id": "test-model", "enable": True}], "count": 1,
+            })
+        assert request.url.path == "/snap-manager/v1/statistics/plugin"
+        return httpx.Response(200, json={
+            "package": {"is_credit_package": True},
+            "metrics": [{
+                "name": "usageTotalPackageCredit", "package_credit_amount": 10, "package_credit_remain": 0,
+            }],
+        })
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    monkeypatch.setattr(runtime, "client", SnapAccessClient(runtime.settings, upstream_client, runtime.resolver))
+    try:
+        models = client.get("/v1/models", headers=AUTH)
+        assert models.status_code == 200, models.text
+        assert [model["id"] for model in models.json()["data"]] == ["test-model"]
+
+        quota = client.post(f"/admin/accounts/{settled['account_id']}/test", headers=AUTH)
+        assert quota.status_code == 200, quota.text
+        assert quota.json()["ok"] is True
+        assert quota.json()["quota"] == {
+            "unit": "credit", "total": 10, "used": None, "remaining": 0, "expiring": None,
+        }
+    finally:
+        client.portal.call(upstream_client.aclose)
 
 
 @pytest.mark.parametrize("redirect", [None, "https://example.invalid/not-requested"])

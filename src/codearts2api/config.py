@@ -98,7 +98,7 @@ class Settings(BaseSettings):
         ),
     )
     campaign_type: str = Field(
-        default="USER_LOGIN",
+        default="DAILY_CLAIM",
         validation_alias=AliasChoices("CA2A_CAMPAIGN_TYPE", "CODEARTS2API_CAMPAIGN_TYPE"),
     )
     checkin_claim_all: bool = Field(

@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, TYPE_CHECKING
 
-from codearts2api.checkin import CheckinResult, account_type_label, is_credit_account, run_checkin
+from codearts2api.checkin import (
+    CheckinResult,
+    account_type_label,
+    extract_business_code,
+    extract_package,
+    is_credit_account,
+    run_checkin,
+)
 from codearts2api.client import SnapAccessClient, UpstreamError
 from codearts2api.credentials import CredentialResolver, ResolvedCredential
 from codearts2api.pool import Account, AccountPool, is_failover_status, now_in_timezone
@@ -163,26 +171,136 @@ async def probe_account(
     try:
         payload = await client.get_plugin_statistics(credential=cred)
     except UpstreamError as exc:
-        logger.info(
-            "account probe failed account=%s status=%s",
-            cred.account_id,
-            exc.status_code,
-        )
-        return {
-            "ok": False,
-            "http_status": exc.status_code,
-            "message": str(exc),
-        }
+        logger.info("account probe failed account=%s status=%s", cred.account_id, exc.status_code)
+        return {"ok": False, "http_status": exc.status_code, "message": str(exc), "quota": None}
     except Exception as exc:  # noqa: BLE001
         logger.exception("account probe failed account=%s", cred.account_id)
-        return {"ok": False, "message": str(exc)}
+        return {"ok": False, "message": str(exc), "quota": None}
+    quota = extract_quota(payload)
+    if extract_package(payload) is None and quota is None:
+        code = _safe_business_code(payload)
+        if code is not None:
+            # HTTP 200 with a business error and no package/metrics is not a
+            # token account; do not report the account as credit-ineligible.
+            logger.info("account probe business error account=%s code=%s", cred.account_id, code)
+            return {
+                "ok": False,
+                "http_status": 200,
+                "account_type": "unknown",
+                "is_credit_package": None,
+                "message": f"Probe failed: upstream business error (code={code})",
+                "quota": None,
+            }
     return {
         "ok": True,
         "http_status": 200,
         "account_type": account_type_label(payload),
         "is_credit_package": is_credit_account(payload),
         "message": "Probe succeeded",
+        "quota": quota,
     }
+
+
+# Metric names and fields from GET /snap-manager/v1/statistics/plugin in the
+# shipped CodeArts Desktop 0.2.9 bundle.
+QUOTA_SPECS: dict[str, dict[str, Any]] = {
+    "credit": {
+        "metric": "usageTotalPackageCredit",
+        "fields": {
+            "total": "package_credit_amount",
+            "used": "package_credit_used",
+            "remaining": "package_credit_remain",
+            "expiring": "package_credit_expiring_amount",
+        },
+    },
+    "token": {
+        "metric": "usageTokenChatMessages",
+        "fields": {"total": "package_token_amount", "used": "usage_token_num"},
+        "derive_remaining": True,
+    },
+}
+
+
+def extract_quota(payload: Any) -> dict[str, Any] | None:
+    """Quota from GET /snap-manager/v1/statistics/plugin (Desktop 0.2.9 fields).
+
+    Credit packages report explicit ``package_credit_*`` values, returned as-is
+    and never derived. Token packages report ``package_token_amount`` and
+    ``usage_token_num``; remaining is their difference only when both counters
+    are known and consistent. Missing, unparseable, negative, or ``-1``
+    (unlimited) values stay ``None`` instead of becoming 0, and a record with
+    no usable value yields no quota at all.
+    """
+    metrics = _metrics(payload)
+    quotas = {unit: _quota(metrics, unit, spec) for unit, spec in QUOTA_SPECS.items()}
+    package = extract_package(payload)
+    kind = package.get("is_credit_package") if isinstance(package, dict) else None
+    if kind is True:
+        return quotas["credit"]
+    if kind is False:
+        return quotas["token"]
+    return quotas["token"] or quotas["credit"]
+
+
+def _metrics(payload: Any) -> list[dict[str, Any]]:
+    """Return metrics[] from the body or its data/result wrapper."""
+    body: dict[str, Any] = payload if isinstance(payload, dict) else {}
+    for candidate in (body, body.get("data"), body.get("result")):
+        records = candidate.get("metrics") if isinstance(candidate, dict) else None
+        if isinstance(records, list):
+            return [record for record in records if isinstance(record, dict)]
+    return []
+
+
+def _quota(metrics: list[dict[str, Any]], unit: str, spec: dict[str, Any]) -> dict[str, Any] | None:
+    record = next((item for item in metrics if str(item.get("name") or "").strip() == spec["metric"]), None)
+    if record is None:
+        return None
+    fields = spec["fields"]
+    values = {
+        key: _number(record.get(fields[key])) if key in fields else None
+        for key in ("total", "used", "remaining", "expiring")
+    }
+    total, used = values["total"], values["used"]
+    if (
+        spec.get("derive_remaining")
+        and values["remaining"] is None
+        and total is not None
+        and used is not None
+        and total >= used
+    ):
+        values["remaining"] = total - used
+    if all(value is None for value in values.values()):
+        return None
+    return {"unit": unit, **values}
+
+
+def _number(value: Any) -> int | float | None:
+    """Return a non-negative finite number, else None; reject bools and sentinels."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            # int() keeps large counters exact; float() accepts decimals.
+            # Both can reject text that looks numeric ("²" is isdigit, and
+            # int() refuses strings above Python's digit limit).
+            value = int(text) if text.lstrip("-").isdigit() else float(text)
+        except ValueError:
+            return None
+    if isinstance(value, int):  # Keep large counters exact; never round-trip via float.
+        return value if value >= 0 else None
+    if isinstance(value, float) and math.isfinite(value) and value >= 0:
+        return int(value) if value.is_integer() else value
+    return None
+
+
+def _safe_business_code(payload: Any) -> str | None:
+    """Return a short sanitized upstream business code, or None."""
+    code = extract_business_code(payload)
+    if code is None:
+        return None
+    return "".join(ch for ch in code if ch.isalnum() or ch in "_.-")[:32] or None
 
 
 async def post_chat_with_failover(

@@ -20,7 +20,16 @@ def extract_model_records(payload: Any) -> list[dict[str, Any]]:
         return [item for item in payload if isinstance(item, dict)]
     if not isinstance(payload, dict):
         return []
-    for key in ("models", "data", "result", "list", "records", "content", "builtin"):
+    for key in (
+        "builtinModels",  # actual GET /v1/model/builtin shape: {builtinModels: [...], count: n}
+        "models",
+        "data",
+        "result",
+        "list",
+        "records",
+        "content",
+        "builtin",
+    ):
         value = payload.get(key)
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]

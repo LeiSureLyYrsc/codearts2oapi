@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +33,13 @@ from codearts2api.credentials import CredentialResolver
 from codearts2api.logging_setup import configure_logging
 from codearts2api.models_catalog import filter_and_map_models, strip_codearts_prefix
 from codearts2api.oauth.dpop import generate_p256_keypair
-from codearts2api.oauth.flow import CallbackServer, LoginError, build_authorize_url
+from codearts2api.oauth.flow import (
+    CALLBACK_TIMEOUT_SECONDS,
+    CallbackServer,
+    LoginError,
+    build_authorize_url,
+    normalize_manual_callback,
+)
 from codearts2api.oauth.pkce import generate_pkce_pair, generate_ticket_id
 from codearts2api.operations import (
     list_models_with_failover,
@@ -42,11 +51,35 @@ from codearts2api.operations import (
 )
 from codearts2api.pool import AccountPool, collect_redaction_secrets
 from codearts2api.scheduler import CheckinScheduler
-from codearts2api.schemas import AccountCreateRequest, AccountUpdateRequest, ChatCompletionsRequest, CheckinRequest
+from codearts2api.oauth.session import SESSION_FILENAME
+from codearts2api.schemas import (
+    AccountCreateRequest,
+    AccountUpdateRequest,
+    ChatCompletionsRequest,
+    CheckinRequest,
+    OAuthLoginStartRequest,
+)
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Retain finished login results so status polling and a duplicate submit never
+# consume each other's success, then forget them.
+LOGIN_RESULT_TTL_SECONDS = 900.0
+LOGIN_RESULTS_MAX = 16
+LOGIN_BODY_LIMIT = 16 * 1024
+LOGIN_EXCHANGE_ERROR = "换取凭证失败：授权码可能已失效或已被使用，请重新开始授权。"
+LOGIN_WRITE_ERROR = "无法写入本机凭证文件，请检查数据目录权限后重试。"
+LOGIN_NAME_TAKEN = "已存在同名账号，请换一个名称后重新开始授权。"
+LOGIN_CALLBACK_INVALID = (
+    "回调地址无效：请粘贴以 http://127.0.0.1:<端口>/oauth/callback? 开头的完整地址，"
+    "并包含一个 code 或 secret 参数。"
+)
+LOGIN_CALLBACK_HINT = (
+    "在能访问本机回环地址的浏览器中打开 authorize_url 完成授权；"
+    "若回调页面打不开，请把浏览器地址栏里的完整回调地址粘贴回本页。"
+)
 
 
 class ModelCache:
@@ -69,6 +102,38 @@ class ModelCache:
         self._expires_at = 0.0
 
 
+@dataclass
+class LoginAttempt:
+    """One live in-process OAuth attempt, addressed by ``login_id``.
+
+    Holds the listener and PKCE state, so it only lives while pending. Once it
+    settles it is replaced by a :class:`LoginResult` in the finished cache.
+    """
+
+    login_id: str
+    account_id: str | None
+    name: str
+    note: str
+    enabled: bool
+    legacy: bool
+    server: CallbackServer
+    authorize_url: str
+    created_at: float
+    message: str | None = None
+    timer: Any = None
+
+
+@dataclass(frozen=True)
+class LoginResult:
+    """Safe terminal snapshot: no listener, PKCE state, or upstream error text."""
+
+    login_id: str
+    status: str
+    account_id: str | None
+    message: str | None
+    settled_at: float
+
+
 class AppState:
     def __init__(self, settings: Settings, pool: AccountPool) -> None:
         self.settings = settings
@@ -81,9 +146,9 @@ class AppState:
         self.last_checkin: dict[str, Any] | None = None
         self.last_checkin_at: str | None = None
         self.last_checkin_accounts: list[dict[str, Any]] | None = None
-        self.login_server: CallbackServer | None = None
-        self.login_authorize_url: str | None = None
-        self.login_account_id: str | None = None
+        self.login_active: LoginAttempt | None = None
+        self.login_finished: dict[str, LoginResult] = {}
+        self.login_last: str | None = None
 
     def snap(self) -> SnapAccessClient:
         if self.client is None:
@@ -93,6 +158,26 @@ class AppState:
 
 def _state(request: Request) -> AppState:
     return request.app.state.runtime
+
+
+DEFAULT_OAUTH_NAME = "oauth"
+
+
+def _legacy_session_account(pool: AccountPool) -> Any:
+    """The account already bound to the legacy session.json file, if any."""
+    for account in pool.accounts:
+        if account.kind == "oauth" and (account.session_file or "") == SESSION_FILENAME:
+            return account
+    return None
+
+
+def _free_oauth_name(pool: AccountPool) -> str:
+    """A default OAuth name that does not collide with a non-OAuth account."""
+    for candidate in [DEFAULT_OAUTH_NAME, *(f"{DEFAULT_OAUTH_NAME}-{i}" for i in range(2, 100))]:
+        existing = pool.find_by_name(candidate)
+        if existing is None or existing.kind == "oauth":
+            return candidate
+    return f"{DEFAULT_OAUTH_NAME}-{uuid.uuid4().hex[:8]}"
 
 
 def refresh_logging(settings: Settings, pool: AccountPool) -> None:
@@ -208,9 +293,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            if runtime.login_server is not None:
-                runtime.login_server.stop()
-                runtime.login_server = None
+            active = runtime.login_active
+            runtime.login_active = None
+            if active is not None:
+                if active.timer is not None:
+                    active.timer.cancel()
+                    active.timer = None
+                await asyncio.to_thread(active.server.stop)
+            runtime.login_finished.clear()
             if runtime.scheduler is not None:
                 runtime.scheduler.shutdown()
             if runtime.http is not None:
@@ -384,27 +474,251 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "pool": runtime.pool.status_summary(),
         }
 
-    def _start_login(runtime: AppState, account_id: str | None, callback_port: int) -> dict[str, Any]:
+    # ---- OAuth login attempts (all mutations run on the ASGI event loop) ----
+
+    def _prune_logins(runtime: AppState) -> None:
+        cutoff = time.monotonic() - LOGIN_RESULT_TTL_SECONDS
+        for login_id, result in list(runtime.login_finished.items()):
+            if result.settled_at < cutoff:
+                runtime.login_finished.pop(login_id, None)
+        while len(runtime.login_finished) > LOGIN_RESULTS_MAX:
+            oldest = min(runtime.login_finished.values(), key=lambda item: item.settled_at)
+            runtime.login_finished.pop(oldest.login_id, None)
+
+    def _retire_login(
+        runtime: AppState,
+        attempt: LoginAttempt,
+        *,
+        status: str,
+        message: str | None,
+        account_id: str | None = None,
+    ) -> LoginResult:
+        """Stop the listener and keep only a safe terminal snapshot."""
+        if runtime.login_active is attempt:
+            runtime.login_active = None
+        if attempt.timer is not None:
+            attempt.timer.cancel()
+            attempt.timer = None
+        result = LoginResult(
+            login_id=attempt.login_id,
+            status=status,
+            account_id=account_id or attempt.account_id,
+            message=message,
+            settled_at=time.monotonic(),
+        )
+        # Publish the result before the (blocking) listener shutdown so the
+        # attempt is never observably both inactive and unrecorded.
+        runtime.login_finished[attempt.login_id] = result
+        runtime.login_last = attempt.login_id
+        _prune_logins(runtime)
+        attempt.server.stop()
+        return result
+
+    def _schedule_expiry(runtime: AppState, attempt: LoginAttempt) -> None:
+        """Abandon the attempt on the loop even if no request ever arrives again."""
+        loop = asyncio.get_running_loop()
+
+        def expire() -> None:
+            if runtime.login_active is not attempt:
+                return
+            _retire_login(
+                runtime,
+                attempt,
+                status="error",
+                message="授权等待超时，请重新开始。",
+            )
+            logger.info("OAuth attempt expired login_id=%s", attempt.login_id)
+
+        attempt.timer = loop.call_later(CALLBACK_TIMEOUT_SECONDS, expire)
+
+    def _expire_if_stale(runtime: AppState, attempt: LoginAttempt) -> None:
+        """Synchronous fallback in case the loop timer was skipped (e.g. blocked loop)."""
+        if (
+            runtime.login_active is attempt
+            and not attempt.server.done
+            # >= because time.monotonic() is coarse (~15ms on Windows) and a
+            # test or config may set the timeout to 0.
+            and time.monotonic() - attempt.created_at >= CALLBACK_TIMEOUT_SECONDS
+        ):
+            _retire_login(
+                runtime,
+                attempt,
+                status="error",
+                message="授权等待超时，请重新开始。",
+            )
+
+    def _commit_login(runtime: AppState, attempt: LoginAttempt, session: Any) -> str:
+        if attempt.account_id:
+            account = runtime.pool.get(attempt.account_id)
+            if account is None:
+                raise LoginError("账号已在授权期间被删除")
+            # Reauth only replaces the stored session after a successful save.
+            runtime.pool.attach_session(account, session)
+            return account.id
+        if attempt.legacy:
+            # Legacy GET /admin/login keeps its old behavior: reuse the account
+            # bound to session.json, otherwise create the conventional one.
+            if _legacy_session_account(runtime.pool) is not None:
+                account = runtime.pool.find_or_create_oauth(use_legacy_session=True)
+            else:
+                clash = runtime.pool.find_by_name(DEFAULT_OAUTH_NAME)
+                if clash is not None and clash.kind != "oauth":
+                    # Never take over an AK/SK account that happens to be called
+                    # "oauth"; fall back to a free name instead.
+                    account = runtime.pool.find_or_create_oauth(name=_free_oauth_name(runtime.pool))
+                else:
+                    account = runtime.pool.find_or_create_oauth(use_legacy_session=True)
+            runtime.pool.attach_session(account, session)
+            return account.id
+        account = runtime.pool.create_oauth_account(
+            name=attempt.name,
+            session=session,
+            enabled=attempt.enabled,
+            note=attempt.note,
+        )
+        return account.id
+
+    def _settle_active(runtime: AppState) -> None:
+        """Commit the active attempt once its callback exchange has finished."""
+        attempt = runtime.login_active
+        if attempt is None or not attempt.server.done:
+            return
+        session = attempt.server.result
+        error = attempt.server.error
+        if error is not None or session is None:
+            _retire_login(runtime, attempt, status="error", message=LOGIN_EXCHANGE_ERROR)
+            # Log the type only: upstream text can echo the submitted code.
+            logger.warning(
+                "OAuth login failed login_id=%s error=%s",
+                attempt.login_id,
+                type(error).__name__ if error is not None else "missing-session",
+            )
+            return
+        try:
+            account_id = _commit_login(runtime, attempt, session)
+        except ValueError:
+            _retire_login(runtime, attempt, status="error", message=LOGIN_NAME_TAKEN)
+            logger.warning("OAuth login commit rejected login_id=%s", attempt.login_id)
+            return
+        except Exception:  # noqa: BLE001
+            _retire_login(runtime, attempt, status="error", message=LOGIN_WRITE_ERROR)
+            logger.exception("OAuth login commit failed login_id=%s", attempt.login_id)
+            return
+        _retire_login(runtime, attempt, status="logged_in", message=None, account_id=account_id)
+        refresh_logging(runtime.settings, runtime.pool)
+        logger.info("OAuth login completed login_id=%s account_id=%s", attempt.login_id, account_id)
+
+    def _lookup_finished(runtime: AppState, login_id: str) -> LoginResult | None:
+        result = runtime.login_finished.get(login_id)
+        if result is None:
+            return None
+        if result.settled_at < time.monotonic() - LOGIN_RESULT_TTL_SECONDS:
+            runtime.login_finished.pop(login_id, None)
+            return None
+        return result
+
+
+    def _pending_payload(runtime: AppState, attempt: LoginAttempt) -> dict[str, Any]:
+        return {
+            "login_id": attempt.login_id,
+            "status": "pending",
+            "account_id": attempt.account_id,
+            "authorize_url": attempt.authorize_url,
+            "callback_url": attempt.server.callback_url,
+            "client_id": runtime.resolver.endpoints().client_id,
+            "message": attempt.message or LOGIN_CALLBACK_HINT,
+        }
+
+    def _result_payload(runtime: AppState, result: LoginResult) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "login_id": result.login_id,
+            "status": result.status,
+            "account_id": result.account_id,
+        }
+        if result.message:
+            payload["message"] = result.message
+        if result.status == "logged_in":
+            payload["session"] = runtime.resolver.status()
+        return payload
+
+    def _start_login(
+        runtime: AppState,
+        *,
+        account_id: str | None,
+        name: str,
+        note: str,
+        enabled: bool,
+        legacy: bool,
+        callback_port: int,
+        resume_active: bool,
+    ) -> dict[str, Any]:
+        _prune_logins(runtime)
+        active = runtime.login_active
+        if active is not None:
+            # Deadline first: an expired attempt must not be settled as success.
+            _expire_if_stale(runtime, active)
+            active = runtime.login_active
+        if active is not None:
+            _settle_active(runtime)
+            active = runtime.login_active
+        if active is not None:
+            same_target = active.account_id == account_id and (
+                account_id is not None or active.name == name
+            )
+            if resume_active and same_target:
+                return _pending_payload(runtime, active)
+            if legacy and active.legacy:
+                # Legacy GET historically returned the waiting legacy flow.
+                return _pending_payload(runtime, active)
+            raise HTTPException(
+                status_code=409,
+                detail="已有另一次授权正在进行，请先完成或取消它，再开始新的授权。",
+            )
+
         if account_id:
             account = runtime.pool.get(account_id)
             if account is None:
                 raise HTTPException(status_code=404, detail=f"Account not found: {account_id}")
             if account.kind != "oauth":
-                raise HTTPException(status_code=400, detail="OAuth login can only be started for oauth accounts")
-        if runtime.login_server is not None:
-            return {
-                "authorize_url": runtime.login_authorize_url,
-                "callback_url": runtime.login_server.callback_url,
-                "status": "pending",
-                "account_id": runtime.login_account_id,
-                "message": "已有登录正在等待本机回调，请在浏览器中打开授权地址。",
-            }
+                raise HTTPException(
+                    status_code=400,
+                    detail="OAuth login can only be started for oauth accounts",
+                )
+            name = account.name
+        else:
+            name = (name or "").strip()
+            if not name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="请填写账号名称，用于在账号池中区分这个 OAuth 账号。",
+                )
+            if not legacy:
+                # A modern kickoff always creates a new account, so a name clash
+                # (including a legacy OAuth account called "oauth") is reported
+                # instead of silently resuming someone else's flow.
+                clash = runtime.pool.find_by_name(name)
+                if clash is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"已存在同名账号「{name}」，请换一个名称，或先删除旧账号。",
+                    )
+
         endpoints = runtime.resolver.endpoints()
         pkce = generate_pkce_pair()
         ticket_id = generate_ticket_id()
         dpop = generate_p256_keypair()
-        server = CallbackServer(endpoints, port=callback_port)
-        server.start(pkce, ticket_id, dpop)
+        try:
+            server = CallbackServer(endpoints, port=callback_port)
+            server.start(pkce, ticket_id, dpop)
+        except OSError as exc:
+            logger.warning("Cannot start OAuth callback listener (%s)", type(exc).__name__)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "无法启动本机回调端口，可能已被占用。"
+                    "请关闭占用该端口的程序，或修改 oauth_callback_port 后重试。"
+                ),
+            ) from None
         authorize_url = build_authorize_url(
             endpoints,
             port=server.port,
@@ -412,64 +726,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ticket_id=ticket_id,
             code_challenge_method=pkce.code_challenge_method,
         )
-        runtime.login_server = server
-        runtime.login_authorize_url = authorize_url
-        runtime.login_account_id = account_id
-        return {
-            "authorize_url": authorize_url,
-            "callback_url": server.callback_url,
-            "status": "pending",
-            "account_id": account_id,
-            "client_id": endpoints.client_id,
-            "message": (
-                "在浏览器中打开 authorize_url，登录华为云并确认授权。"
-                "官方客户端回调地址为 http://127.0.0.1:<port>/oauth/callback。"
-                "若浏览器与本进程不在同一台机器，请做本机端口转发，"
-                "或在有浏览器的机器上运行 `uv run codearts2api login`。"
-                "然后调用 GET /admin/login/status。"
-            ),
-        }
+        attempt = LoginAttempt(
+            login_id=uuid.uuid4().hex,
+            account_id=account_id,
+            name=name,
+            note=note or "",
+            enabled=bool(enabled),
+            legacy=legacy,
+            server=server,
+            authorize_url=authorize_url,
+            created_at=time.monotonic(),
+        )
+        runtime.login_active = attempt
+        _schedule_expiry(runtime, attempt)
+        return _pending_payload(runtime, attempt)
 
-    def _login_status_payload(runtime: AppState) -> dict[str, Any]:
-        server = runtime.login_server
-        if server is None:
-            return {
-                "status": "idle",
-                "account_id": None,
-                "session": runtime.resolver.status(),
-            }
-        if server._done.is_set():  # noqa: SLF001 — poll the in-process login
-            account_id = runtime.login_account_id
-            try:
-                session = server.wait(timeout=0.1)
-                if account_id:
-                    account = runtime.pool.get(account_id)
-                    if account is None:
-                        raise HTTPException(status_code=404, detail=f"Account not found: {account_id}")
-                    runtime.pool.attach_session(account, session)
-                else:
-                    account = runtime.pool.find_or_create_oauth(use_legacy_session=True)
-                    runtime.pool.attach_session(account, session)
-                    account_id = account.id
-                refresh_logging(runtime.settings, runtime.pool)
-            except LoginError as exc:
-                return {"status": "error", "message": str(exc), "account_id": account_id}
-            finally:
-                server.stop()
-                runtime.login_server = None
-                runtime.login_authorize_url = None
-                runtime.login_account_id = None
-            return {
-                "status": "logged_in",
-                "account_id": account_id,
-                "session": runtime.resolver.status(),
-            }
-        return {
-            "status": "pending",
-            "account_id": runtime.login_account_id,
-            "authorize_url": runtime.login_authorize_url,
-            "callback_url": server.callback_url,
-        }
+
+    @protected.post("/admin/login/start")
+    async def post_admin_login_start(
+        body: OAuthLoginStartRequest,
+        request: Request,
+        current_settings: Settings = Depends(get_settings),
+    ) -> dict[str, Any]:
+        """Begin a new-account OAuth flow; the account is written on success."""
+        return _start_login(
+            _state(request),
+            account_id=None,
+            name=body.name,
+            note=body.note,
+            enabled=body.enabled,
+            legacy=False,
+            callback_port=current_settings.oauth_callback_port,
+            resume_active=False,
+        )
 
     @protected.get("/admin/login")
     async def get_admin_login(
@@ -477,12 +766,167 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         account_id: str | None = Query(default=None),
         current_settings: Settings = Depends(get_settings),
     ) -> dict[str, Any]:
-        """Start (or resume) the official CLI loopback OAuth flow and return the authorize URL."""
-        return _start_login(_state(request), account_id, current_settings.oauth_callback_port)
+        """Legacy entry point: start (or resume) the official CLI loopback OAuth flow."""
+        if account_id:
+            return _start_login(
+                _state(request),
+                account_id=account_id,
+                name="",
+                note="",
+                enabled=True,
+                legacy=False,
+                callback_port=current_settings.oauth_callback_port,
+                resume_active=False,
+            )
+        return _start_login(
+            _state(request),
+            account_id=None,
+            name=DEFAULT_OAUTH_NAME,
+            note="",
+            enabled=True,
+            legacy=True,
+            callback_port=current_settings.oauth_callback_port,
+            resume_active=True,
+        )
 
     @protected.get("/admin/login/status")
-    async def get_admin_login_status(request: Request) -> dict[str, Any]:
-        return _login_status_payload(_state(request))
+    async def get_admin_login_status(
+        request: Request,
+        login_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        runtime = _state(request)
+        _prune_logins(runtime)
+        if login_id:
+            active = runtime.login_active
+            if active is not None and active.login_id == login_id:
+                # Only the addressed attempt is settled; a stale ID never
+                # touches (or commits) a different in-flight flow.
+                _settle_active(runtime)
+                active = runtime.login_active
+                if active is not None and active.login_id == login_id:
+                    _expire_if_stale(runtime, active)
+                    if runtime.login_active is active:
+                        return _pending_payload(runtime, active)
+            result = _lookup_finished(runtime, login_id)
+            if result is None:
+                return {
+                    "status": "idle",
+                    "account_id": None,
+                    "message": "本次授权会话已结束或已过期，请重新开始。",
+                }
+            return _result_payload(runtime, result)
+        active = runtime.login_active
+        if active is not None:
+            _expire_if_stale(runtime, active)
+            active = runtime.login_active
+        if active is not None and active.legacy:
+            # Legacy flow: the unscoped poll owns it, as before.
+            _settle_active(runtime)
+            active = runtime.login_active
+        if active is not None:
+            if active.legacy:
+                return _pending_payload(runtime, active)
+            # Unscoped status is legacy-compatible only: never hand out a modern
+            # flow's login_id (a capability to poll URLs or cancel) or its URLs.
+            return {
+                "status": "pending",
+                "account_id": None,
+                "message": "已有另一次授权正在进行，请回到发起授权的页面继续。",
+            }
+        last = _lookup_finished(runtime, runtime.login_last) if runtime.login_last else None
+        if last is not None:
+            return _result_payload(runtime, last)
+        return {
+            "status": "idle",
+            "account_id": None,
+            "session": runtime.resolver.status(),
+        }
+
+    @protected.post("/admin/login/callback")
+    async def post_admin_login_callback(request: Request) -> dict[str, Any]:
+        """Accept a pasted loopback callback URL; it is validated, never fetched.
+
+        The body is parsed by hand so a validation failure cannot echo the raw
+        URL (a pydantic 422 would include the submitted input).
+        """
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > LOGIN_BODY_LIMIT:
+                raise HTTPException(status_code=413, detail="回调请求内容过大。")
+        try:
+            body = json.loads(raw or b"{}")
+        except (ValueError, UnicodeError):
+            raise HTTPException(status_code=400, detail=LOGIN_CALLBACK_INVALID) from None
+        login_id = body.get("login_id") if isinstance(body, dict) else None
+        callback_url = body.get("callback_url") if isinstance(body, dict) else None
+        if not isinstance(login_id, str) or not isinstance(callback_url, str):
+            raise HTTPException(status_code=400, detail=LOGIN_CALLBACK_INVALID)
+
+        runtime = _state(request)
+        _prune_logins(runtime)
+        active = runtime.login_active
+        if active is None or active.login_id != login_id:
+            # A settled ID returns its terminal result without touching the URL;
+            # an unknown or cancelled ID cannot be retried.
+            result = _lookup_finished(runtime, login_id)
+            if result is not None:
+                return _result_payload(runtime, result)
+            raise HTTPException(
+                status_code=400,
+                detail="本次授权会话已结束或已过期，请重新开始授权。",
+            )
+        # Address-based: only this attempt may be settled, never a newer one.
+        _settle_active(runtime)
+        active = runtime.login_active
+        if active is None or active.login_id != login_id:
+            result = _lookup_finished(runtime, login_id)
+            if result is not None:
+                return _result_payload(runtime, result)
+            raise HTTPException(status_code=400, detail="本次授权会话已结束，请重新开始授权。")
+        _expire_if_stale(runtime, active)
+        if runtime.login_active is not active:
+            result = _lookup_finished(runtime, login_id)
+            if result is not None:
+                return _result_payload(runtime, result)
+            raise HTTPException(status_code=400, detail="本次授权会话已结束，请重新开始授权。")
+
+        try:
+            carrier = normalize_manual_callback(callback_url, expected_port=active.server.port)
+        except ValueError:
+            # Static message: the submitted URL is neither echoed nor logged.
+            raise HTTPException(status_code=400, detail=LOGIN_CALLBACK_INVALID) from None
+        try:
+            active.server.submit_manual(carrier)
+        except ValueError:
+            # A browser callback or an earlier submit already owns this attempt.
+            return _pending_payload(runtime, active)
+        active.message = "回调已收到，正在换取凭证…"
+        logger.info("OAuth manual callback accepted login_id=%s", active.login_id)
+        return _pending_payload(runtime, active)
+
+    @protected.delete("/admin/login")
+    async def delete_admin_login(
+        request: Request,
+        login_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        runtime = _state(request)
+        if not login_id:
+            # Cancellation is addressed by login_id only; there is no global cancel.
+            raise HTTPException(status_code=400, detail="请提供 login_id 以取消对应的授权。")
+        _prune_logins(runtime)
+        active = runtime.login_active
+        if active is not None and active.login_id == login_id:
+            # Cancel without settling: a result that arrives later is discarded,
+            # and a finished exchange cannot slip a write in during cancel.
+            _retire_login(runtime, active, status="idle", message="本次授权已取消。")
+            logger.info("OAuth login cancelled login_id=%s", login_id)
+            return {"ok": True, "login_id": login_id, "status": "idle"}
+        result = _lookup_finished(runtime, login_id)
+        if result is not None:
+            return {"ok": True, "login_id": login_id, "status": result.status}
+        return {"ok": True, "login_id": login_id, "status": "idle"}
+
 
     @protected.post("/admin/benefit-claim")
     async def post_benefit_claim(
@@ -552,6 +996,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @protected.post("/admin/accounts")
     async def post_admin_accounts(body: AccountCreateRequest, request: Request) -> dict[str, Any]:
         runtime = _state(request)
+        if body.kind == "oauth":
+            # OAuth credentials only ever come from the browser/ticket exchange;
+            # even a supplied ak/sk would be ignored by the resolver, so a direct
+            # create would silently yield an unusable account.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "OAuth 账号的凭证来自浏览器授权，不能直接创建。"
+                    "请使用 POST /admin/login/start 开始授权，成功后再写入账号池；"
+                    "若要迁移已有账号，请导出 Auth JSON 并通过 POST /admin/accounts/import 导入。"
+                ),
+            )
         try:
             account = runtime.pool.add_account(
                 name=body.name,
@@ -645,7 +1101,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         current_settings: Settings = Depends(get_settings),
     ) -> dict[str, Any]:
-        return _start_login(_state(request), account_id, current_settings.oauth_callback_port)
+        """Reauthorize an existing OAuth account in place."""
+        return _start_login(
+            _state(request),
+            account_id=account_id,
+            name="",
+            note="",
+            enabled=True,
+            legacy=False,
+            callback_port=current_settings.oauth_callback_port,
+            resume_active=True,
+        )
 
     @protected.get("/admin/accounts/{account_id}/login")
     async def get_admin_account_login_status(account_id: str, request: Request) -> dict[str, Any]:
@@ -653,13 +1119,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         account = runtime.pool.get(account_id)
         if account is None:
             raise HTTPException(status_code=404, detail=f"Account not found: {account_id}")
-        payload = _login_status_payload(runtime)
-        if payload.get("status") == "pending" and runtime.login_account_id not in {account_id, None}:
-            payload = {
-                **payload,
-                "message": "当前正在为另一个账号等待 OAuth 回调。",
-            }
-        return payload
+        _prune_logins(runtime)
+        _settle_active(runtime)
+        active = runtime.login_active
+        if active is not None:
+            _expire_if_stale(runtime, active)
+            if runtime.login_active is active:
+                if active.account_id == account_id:
+                    return _pending_payload(runtime, active)
+                # Never leak another target's login_id or in-progress URLs.
+                return {
+                    "status": "pending",
+                    "account_id": None,
+                    "message": "当前正在为另一个账号等待 OAuth 回调。",
+                }
+        for login_id in reversed(list(runtime.login_finished)):
+            result = runtime.login_finished[login_id]
+            if result.account_id == account_id:
+                return _result_payload(runtime, result)
+        return {"status": "idle", "account_id": account_id}
 
     app.include_router(protected)
     if static_dir.is_dir():

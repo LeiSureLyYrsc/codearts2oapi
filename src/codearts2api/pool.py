@@ -455,6 +455,49 @@ class AccountPool:
             logger.info("Created OAuth pool account id=%s name=%s", account.id, account.name)
             return account
 
+    def create_oauth_account(
+        self,
+        *,
+        name: str,
+        session: OAuthSession,
+        enabled: bool = True,
+        note: str = "",
+    ) -> Account:
+        """Create an OAuth account and its first session in one atomic write.
+
+        The auth file is written first; the account joins the live pool only after
+        the write succeeds, so a failed write leaves no half-created account.
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("请填写账号名称")
+        if not session.access_key_id or not session.secret_access_key:
+            raise ValueError("OAuth session is missing credentials")
+        with self._lock:
+            if self.find_by_name(name) is not None:
+                raise ValueError(f"已存在同名账号「{name}」，请换一个名称，或先删除旧账号。")
+            now = utc_now_iso()
+            account_id = str(uuid.uuid4())
+            account = Account(
+                id=account_id,
+                name=name,
+                kind="oauth",
+                enabled=bool(enabled),
+                note=note or "",
+                session_file=f"{account_id}.json",
+                created_at=now,
+                updated_at=now,
+            )
+            path = self.accounts_dir / account_filename(account.id)
+            write_private_json(path, {
+                "version": 1,
+                "account": account.to_storage(),
+                "oauth_session": session.to_dict(),
+            })
+            self.accounts.append(account)
+            logger.info("Created OAuth pool account id=%s name=%s", account.id, account.name)
+            return account
+
     def add_account(
         self,
         *,

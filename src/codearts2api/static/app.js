@@ -13,6 +13,20 @@
 
   let pollTimer = null;
 
+  // One authorization at a time. `gen` invalidates every late async callback
+  // (poll response, start response, paste-submit) so a closed or restarted
+  // dialog never writes into a newer flow.
+  const auth = {
+    gen: 0,
+    pollSeq: 0,
+    mode: "create",
+    accountId: null,
+    loginId: null,
+    draft: null,
+    submitting: false,
+    finished: false,
+  };
+
   function getKey() {
     return sessionStorage.getItem(KEY) || "";
   }
@@ -133,7 +147,7 @@
   function renderAccounts(accounts) {
     const body = $("account-rows");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="7" class="muted">还没有账号。可添加 AK/SK，或添加 OAuth 账号后走官方浏览器登录。</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" class="muted">还没有账号。点击「连接 OAuth 账号」走华为云授权，或添加 AK/SK 账号、导入 Auth 文件。</td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -153,7 +167,7 @@
           <button type="button" class="btn small" data-act="export">导出 Auth</button>
           <button type="button" class="btn small" data-act="edit">编辑</button>
           <button type="button" class="btn small" data-act="test">探测</button>
-          ${account.kind === "oauth" ? '<button type="button" class="btn small" data-act="login">OAuth 登录</button>' : ""}
+          ${account.kind === "oauth" ? '<button type="button" class="btn small" data-act="login">重新授权</button>' : ""}
           <button type="button" class="btn small" data-act="checkin">签到</button>
           <button type="button" class="btn small danger" data-act="delete">删除</button>
         </td>
@@ -212,7 +226,7 @@
         return;
       }
       if (act === "login") {
-        startOauthLogin(account);
+        openAuthDialog(account);
         return;
       }
       if (act === "checkin") {
@@ -241,36 +255,31 @@
     finally { event.target.value = ""; }
   });
 
-  function openAccountDialog(account, kind) {
+  function openAccountDialog(account) {
     const form = $("account-form");
     form.reset();
     $("account-error").classList.add("hidden");
     const isEdit = Boolean(account);
-    const accountKind = account ? account.kind : (kind || "aksk");
-    form.kind.value = accountKind;
+    // OAuth credentials come from the browser flow, so this dialog only edits
+    // the label/remark/enabled flag for those accounts.
+    const isOauth = isEdit && account.kind === "oauth";
+    form.kind.value = isEdit ? account.kind : "aksk";
     form.id.value = account ? account.id : "";
     form.name.value = account ? account.name : "";
     form.note.value = account ? account.note : "";
     form.enabled.checked = account ? account.enabled : true;
     form.project_id.value = account && account.project_id ? account.project_id : "";
-    $("account-dialog-title").textContent = isEdit ? `编辑账号 · ${account.name}` : (accountKind === "oauth" ? "添加 OAuth 账号" : "添加 AK/SK 账号");
-    $("aksk-fields").hidden = accountKind === "oauth" && !isEdit ? true : accountKind === "oauth";
-    if (accountKind === "aksk") $("aksk-fields").hidden = false;
-    $("secret-hint").hidden = !isEdit || accountKind !== "aksk";
-    if (accountKind === "aksk") {
-      form.ak.required = !isEdit;
-      form.sk.required = !isEdit;
-      form.ak.placeholder = isEdit ? "留空表示保持原值" : "";
-      form.sk.placeholder = isEdit ? "留空表示保持原值" : "";
-    } else {
-      form.ak.required = false;
-      form.sk.required = false;
-    }
+    $("account-dialog-title").textContent = isEdit ? `编辑账号 · ${account.name}` : "添加 AK/SK 账号";
+    $("aksk-fields").hidden = isOauth;
+    $("secret-hint").hidden = !isEdit || isOauth;
+    form.ak.required = !isEdit && !isOauth;
+    form.sk.required = !isEdit && !isOauth;
+    form.ak.placeholder = isEdit ? "留空表示保持原值" : "";
+    form.sk.placeholder = isEdit ? "留空表示保持原值" : "";
     accountDialog.showModal();
   }
 
-  $("btn-add-aksk").addEventListener("click", () => openAccountDialog(null, "aksk"));
-  $("btn-add-oauth").addEventListener("click", () => openAccountDialog(null, "oauth"));
+  $("btn-add-aksk").addEventListener("click", () => openAccountDialog(null));
   $("btn-account-cancel").addEventListener("click", () => accountDialog.close());
 
   $("account-form").addEventListener("submit", async (event) => {
@@ -306,65 +315,401 @@
     }
   });
 
-  async function startOauthLogin(account) {
-    $("oauth-account-label").textContent = `${account.name} (${account.id})`;
-    $("oauth-status").textContent = "正在启动…";
-    $("oauth-url-wrap").hidden = true;
-    $("oauth-callback").textContent = "";
-    loginDialog.showModal();
-    try {
-      const data = await api(`admin/accounts/${account.id}/login`, { method: "POST" });
-      showOauthStatus(data);
-      if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(async () => {
-        try {
-          const status = await api(`admin/accounts/${account.id}/login`);
-          showOauthStatus(status);
-          if (status.status === "logged_in" || status.status === "error" || status.status === "idle") {
-            clearInterval(pollTimer);
-            pollTimer = null;
-            if (status.status === "logged_in") {
-              toast("OAuth 登录成功");
-              await loadAll();
-            }
-          }
-        } catch (err) {
-          $("oauth-status").textContent = err.message;
-        }
-      }, 1500);
-    } catch (err) {
-      $("oauth-status").textContent = err.message;
-    }
+  /* ---------- OAuth: authorize first, then save the account ---------- */
+
+  const POLL_INTERVAL_MS = 1500;
+
+  function setAuthStep(step) {
+    $("login-step-details").classList.toggle("hidden", step !== "details");
+    $("login-step-auth").classList.toggle("hidden", step !== "auth");
+    $("login-step-done").classList.toggle("hidden", step !== "done");
   }
 
-  function showOauthStatus(data) {
-    $("oauth-status").textContent = data.status || "unknown";
-    if (data.authorize_url) {
-      $("oauth-url-wrap").hidden = false;
-      const link = $("oauth-url");
-      link.href = data.authorize_url;
-      link.textContent = data.authorize_url;
-    }
-    $("oauth-callback").textContent = data.callback_url ? `回调地址：${data.callback_url}` : (data.message || "");
+  function setAuthStatus(kind, text) {
+    const label = $("oauth-status");
+    label.textContent = text;
+    const wrap = label.parentElement;
+    if (wrap) wrap.className = `auth-status ${kind}`;
   }
 
-  $("btn-copy-url").addEventListener("click", async () => {
-    const url = $("oauth-url").textContent;
-    if (!url) return;
-    try {
-      await navigator.clipboard.writeText(url);
-      toast("已复制授权地址");
-    } catch {
-      toast("复制失败，请手动选择地址");
-    }
-  });
+  function showAuthError(message) {
+    $("auth-error").textContent = message || "";
+    $("auth-error").classList.toggle("hidden", !message);
+  }
 
-  $("btn-login-close").addEventListener("click", () => {
+  function showCallbackError(message) {
+    $("callback-error").textContent = message || "";
+    $("callback-error").classList.toggle("hidden", !message);
+  }
+
+  function resetAuthError() {
+    $("login-start-error").classList.add("hidden");
+    showAuthError("");
+    showCallbackError("");
+  }
+
+  // The paste box is useless before a login_id exists: submitting then would
+  // look like a failure even though startup is merely still in flight.
+  function setCallbackReady(ready) {
+    $("btn-submit-callback").disabled = !ready;
+  }
+
+  function stopPolling() {
     if (pollTimer) {
-      clearInterval(pollTimer);
+      clearTimeout(pollTimer);
       pollTimer = null;
     }
-    loginDialog.close();
+    // Invalidates any poll request that is already awaiting a response.
+    auth.pollSeq += 1;
+  }
+
+  async function copyText(text, message) {
+    const value = String(text || "").trim();
+    if (!value) return;
+    // navigator.clipboard needs a secure context. A gateway reached over plain
+    // http:// (LAN address or forwarded port) has none, so keep a manual path.
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(value);
+        toast(message);
+        return;
+      } catch {
+        /* fall through */
+      }
+    }
+    const field = $("authorize-url");
+    field.focus();
+    field.select();
+    field.setSelectionRange(0, value.length);
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    toast(copied ? message : "已选中地址，请按 Ctrl+C 复制");
+  }
+
+  function applyAuthPayload(data) {
+    if (!data) return;
+    if (data.login_id) auth.loginId = data.login_id;
+    if (!data.authorize_url) {
+      if (auth.loginId) setCallbackReady(true);
+      return;
+    }
+    $("authorize-url").value = data.authorize_url;
+    $("btn-copy-url").disabled = false;
+    const link = $("oauth-open-link");
+    link.href = data.authorize_url;
+    link.classList.remove("hidden");
+    if (auth.loginId) setCallbackReady(true);
+  }
+
+  // Clear everything that belongs to one authorization attempt. Called on open,
+  // on start, and on retry so a stale URL/paste can never carry over.
+  function resetFlowUi() {
+    $("callback-url-input").value = "";
+    $("authorize-url").value = "";
+    $("oauth-open-link").classList.add("hidden");
+    $("btn-copy-url").disabled = true;
+    setCallbackReady(false);
+    $("btn-login-retry").hidden = true;
+  }
+
+  function openAuthDialog(account) {
+    // Bumping the generation abandons any previous flow and its in-flight work.
+    const previous = !auth.finished ? auth.loginId : null;
+    auth.gen += 1;
+    stopPolling();
+    auth.mode = account ? "reauth" : "create";
+    auth.accountId = account ? account.id : null;
+    auth.loginId = null;
+    if (previous) cancelLogin(previous);
+    auth.draft = account
+      ? { name: account.name, note: account.note || "", enabled: account.enabled }
+      : null;
+    auth.submitting = false;
+    auth.finished = false;
+
+    const form = $("login-start-form");
+    form.reset();
+    resetAuthError();
+    resetFlowUi();
+
+    $("login-title").textContent = account ? "重新授权 CodeArts 账号" : "连接 CodeArts 账号";
+    $("login-subtitle").textContent = account
+      ? `为「${account.name}」重新登录，成功后替换旧凭证。`
+      : "先在浏览器完成华为云授权，成功后再写入账号池。";
+
+    if (account) {
+      setAuthStatus("pending", "正在启动授权…");
+      setAuthStep("auth");
+    } else {
+      setAuthStatus("pending", "准备中");
+      setAuthStep("details");
+    }
+    loginDialog.showModal();
+    if (account) startAuthFlow(auth.gen);
+    else form.name.focus();
+  }
+
+  async function startAuthFlow(gen) {
+    auth.finished = false;
+    auth.submitting = false;
+    resetAuthError();
+    resetFlowUi();
+    setAuthStep("auth");
+    setAuthStatus("pending", "正在启动授权…");
+    try {
+      let data;
+      if (auth.mode === "reauth") {
+        data = await api(`admin/accounts/${encodeURIComponent(auth.accountId)}/login`, { method: "POST" });
+      } else {
+        data = await api("admin/login/start", {
+          method: "POST",
+          body: JSON.stringify(auth.draft || {}),
+        });
+      }
+      if (gen !== auth.gen) {
+        // The dialog was closed or restarted while this request was in flight.
+        if (data && data.login_id) cancelLogin(data.login_id);
+        return;
+      }
+      applyAuthPayload(data);
+      if (data && data.status === "logged_in") {
+        await finishAuth();
+        return;
+      }
+      setAuthStatus("pending", "等待浏览器完成授权…");
+      schedulePoll(gen);
+    } catch (err) {
+      if (gen !== auth.gen) return;
+      if (auth.mode === "create") {
+        // Name conflicts and validation errors belong on the form so they can be fixed.
+        setAuthStep("details");
+        const form = $("login-start-form");
+        if (auth.draft) {
+          form.name.value = auth.draft.name || "";
+          form.note.value = auth.draft.note || "";
+          form.enabled.checked = auth.draft.enabled !== false;
+        }
+        $("login-start-error").textContent = err.message;
+        $("login-start-error").classList.remove("hidden");
+        form.name.focus();
+        return;
+      }
+      setAuthStatus("error", "启动失败");
+      showAuthError(err.message);
+      $("btn-login-retry").hidden = false;
+    }
+  }
+
+  function schedulePoll(gen) {
+    stopPolling();
+    if (gen !== auth.gen || auth.finished || auth.submitting) return;
+    if (!auth.loginId) {
+      setAuthStatus("error", "授权会话已丢失");
+      showAuthError("没有拿到授权会话，请重新开始。");
+      $("btn-login-retry").hidden = false;
+      return;
+    }
+    const loginId = auth.loginId;
+    const seq = auth.pollSeq;
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      if (gen !== auth.gen || seq !== auth.pollSeq || auth.finished || auth.submitting) return;
+      void pollLogin(gen, loginId, seq);
+    }, POLL_INTERVAL_MS);
+  }
+
+  async function pollLogin(gen, loginId, seq) {
+    try {
+      const status = await api(`admin/login/status?login_id=${encodeURIComponent(loginId)}`);
+      if (gen !== auth.gen || seq !== auth.pollSeq || auth.finished || auth.submitting) return;
+      applyAuthPayload(status);
+      if (status.status === "logged_in") {
+        await finishAuth();
+        return;
+      }
+      if (status.status === "pending") {
+        setAuthStatus("pending", "等待浏览器完成授权…");
+        schedulePoll(gen);
+        return;
+      }
+      if (status.status === "error") {
+        setAuthStatus("error", "授权失败");
+        showAuthError(status.message || "授权未完成，请重新开始。");
+      } else {
+        setAuthStatus("idle", "授权会话已结束");
+        showAuthError(status.message || "本次授权会话已结束（可能已超时），请重新开始。");
+      }
+      $("btn-login-retry").hidden = false;
+    } catch (err) {
+      if (gen !== auth.gen || seq !== auth.pollSeq) return;
+      setAuthStatus("error", "无法获取授权状态");
+      showAuthError(err.message);
+      $("btn-login-retry").hidden = false;
+    }
+  }
+
+  async function finishAuth() {
+    if (auth.finished) return;
+    auth.finished = true;
+    stopPolling();
+    auth.loginId = null;
+    const name = (auth.draft && auth.draft.name) || "账号";
+    setAuthStep("done");
+    $("login-done-name").textContent = name;
+    $("login-done-detail").textContent = "之后如果提示凭证过期或失效，点账号列表里这个账号的「重新授权」即可。";
+    toast(auth.mode === "reauth" ? "已重新授权" : "OAuth 账号已连接");
+    $("btn-login-done").focus();
+    try {
+      await loadAll();
+    } catch {
+      /* the success view is still valid; the table refreshes on the next load */
+    }
+  }
+
+  async function cancelLogin(loginId) {
+    if (!loginId) return;
+    try {
+      await api(`admin/login?login_id=${encodeURIComponent(loginId)}`, { method: "DELETE" });
+    } catch {
+      /* best effort: the backend expires abandoned flows anyway */
+    }
+  }
+
+  function closeAuthDialog(options) {
+    const cancel = !options || options.cancel !== false;
+    const pending = cancel && !auth.finished && auth.loginId;
+    auth.gen += 1;
+    stopPolling();
+    auth.loginId = null;
+    auth.finished = false;
+    auth.submitting = false;
+    if (loginDialog.open) loginDialog.close();
+    if (pending) cancelLogin(pending);
+  }
+
+  $("btn-add-oauth").addEventListener("click", () => openAuthDialog(null));
+
+  $("login-start-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const name = form.name.value.trim();
+    if (!name) {
+      $("login-start-error").textContent = "请填写账号名称，用来在账号池里区分。";
+      $("login-start-error").classList.remove("hidden");
+      form.name.focus();
+      return;
+    }
+    auth.draft = { name, note: form.note.value.trim(), enabled: form.enabled.checked };
+    startAuthFlow(auth.gen);
+  });
+
+  $("btn-login-retry").addEventListener("click", async () => {
+    // A retry is a fresh attempt: invalidate the old poll before touching state.
+    auth.gen += 1;
+    const gen = auth.gen;
+    stopPolling();
+    const stale = auth.loginId;
+    auth.loginId = null;
+    if (stale) await cancelLogin(stale);
+    if (gen !== auth.gen || !loginDialog.open) return;
+    await startAuthFlow(gen);
+  });
+
+  $("btn-login-cancel-start").addEventListener("click", () => closeAuthDialog({ cancel: false }));
+  $("btn-login-cancel").addEventListener("click", () => closeAuthDialog());
+  $("btn-login-close").addEventListener("click", () => closeAuthDialog());
+  $("btn-login-done").addEventListener("click", () => closeAuthDialog({ cancel: false }));
+  loginDialog.addEventListener("cancel", (event) => {
+    // Esc must go through the same cancellation path as the buttons.
+    event.preventDefault();
+    closeAuthDialog();
+  });
+
+  $("btn-copy-url").addEventListener("click", () => copyText($("authorize-url").value, "已复制授权地址"));
+  $("authorize-url").addEventListener("focus", (event) => event.target.select());
+  $("authorize-url").addEventListener("click", (event) => event.target.select());
+
+  function looksLikeCallback(raw) {
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      return false;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    if (!url.pathname.replace(/\/+$/, "").endsWith("/oauth/callback")) return false;
+    return url.search.length > 1;
+  }
+
+  $("callback-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (auth.submitting) return;
+    const gen = auth.gen;
+    const raw = $("callback-url-input").value.trim();
+    const button = $("btn-submit-callback");
+    showCallbackError("");
+    if (!raw) {
+      showCallbackError("请粘贴浏览器地址栏里的完整回调地址。");
+      return;
+    }
+    if (!looksLikeCallback(raw)) {
+      showCallbackError("需要一个完整的回调地址：http(s)://主机/oauth/callback?…，并且带上 ? 后面的 code 或 secret 参数。");
+      return;
+    }
+    if (!auth.loginId) {
+      showCallbackError("当前授权会话不可用，请重新开始授权。");
+      $("btn-login-retry").hidden = false;
+      return;
+    }
+    // The submit owns the next status read; drop the queued poll first.
+    stopPolling();
+    auth.submitting = true;
+    button.disabled = true;
+    let resumePoll = true;
+    setAuthStatus("pending", "正在校验回调地址…");
+    try {
+      const status = await api("admin/login/callback", {
+        method: "POST",
+        body: JSON.stringify({ login_id: auth.loginId, callback_url: raw }),
+      });
+      if (gen !== auth.gen) return;
+      applyAuthPayload(status);
+      if (status.status === "logged_in") {
+        $("callback-url-input").value = "";
+        await finishAuth();
+        return;
+      }
+      $("callback-url-input").value = "";
+      if (status.status === "pending") {
+        setAuthStatus("pending", "回调已收到，正在换取凭证…");
+        return;
+      }
+      resumePoll = false;
+      if (status.status === "error") {
+        setAuthStatus("error", "授权失败");
+        showCallbackError(status.message || "回调地址无效，请重新复制地址栏里的完整地址。");
+      } else {
+        setAuthStatus("idle", "授权会话已结束");
+        showCallbackError(status.message || "本次授权会话已结束，请重新开始。");
+      }
+      $("btn-login-retry").hidden = false;
+    } catch (err) {
+      if (gen !== auth.gen) return;
+      // A rejected URL keeps the flow pending, so the user can paste again.
+      showCallbackError(err.message || "回调地址无效，请重新复制地址栏里的完整地址。");
+      setAuthStatus("pending", "等待浏览器完成授权…");
+    } finally {
+      // A newer dialog may already own these flags; only the same generation clears them.
+      if (gen === auth.gen) {
+        auth.submitting = false;
+        button.disabled = false;
+        if (resumePoll && !auth.finished && auth.loginId) schedulePoll(gen);
+      }
+    }
   });
 
   function renderStatus(data) {

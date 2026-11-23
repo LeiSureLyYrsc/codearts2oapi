@@ -51,6 +51,14 @@ class AccountUpdateRequest(BaseModel):
     project_id: str | None = None
 
 
+class OAuthLoginStartRequest(BaseModel):
+    """Kick off a new OAuth account; the account exists only after success."""
+
+    name: str = Field(min_length=1, max_length=80)
+    note: str = Field(default="", max_length=200)
+    enabled: bool = True
+
+
 class OpenAIErrorBody(BaseModel):
     message: str
     type: str = "api_error"

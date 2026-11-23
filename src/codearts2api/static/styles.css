@@ -147,8 +147,84 @@ dialog {
   box-shadow: var(--shadow);
 }
 dialog::backdrop { background: rgba(16, 22, 32, 0.35); }
-dialog form, .dialog-body { padding: 20px; }
+#account-dialog form, .dialog-body { padding: 20px; }
 .break-all { word-break: break-all; }
+
+/* OAuth connect flow */
+.auth-dialog { width: min(600px, 94vw); }
+.dialog-head { display: flex; gap: 12px; align-items: flex-start; justify-content: space-between; }
+.dialog-head h3 { margin: 0; }
+.dialog-sub { margin: 4px 0 0; }
+.btn.icon {
+  padding: 2px 9px;
+  font-size: 20px;
+  line-height: 1.2;
+  color: var(--muted);
+  border-color: transparent;
+}
+.auth-step { margin-top: 14px; }
+.auth-steps {
+  margin: 0 0 16px;
+  padding: 12px 12px 12px 30px;
+  background: #f7f9fb;
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+.auth-steps li + li { margin-top: 4px; }
+.field-block { margin: 0 0 14px; }
+.field-label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.copy-row { display: flex; gap: 8px; align-items: stretch; }
+.copy-row input { margin-top: 0; flex: 1 1 auto; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.copy-row .btn { flex: 0 0 auto; align-self: stretch; margin: 0; }
+.actions.compact { margin-top: 8px; }
+.muted.small { font-size: 12px; margin: 6px 0 0; }
+.field-block label { margin-top: 0; }
+
+.auth-status {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin: 4px 0 12px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.auth-status .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--muted);
+  flex: 0 0 auto;
+}
+.auth-status.pending .dot { background: var(--warn); animation: pulse 1.4s ease-in-out infinite; }
+.auth-status.logged_in { color: var(--ok); }
+.auth-status.logged_in .dot { background: var(--ok); }
+.auth-status.error { color: var(--danger); }
+.auth-status.error .dot { background: var(--danger); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.75); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .auth-status.pending .dot { animation: none; }
+}
+
+.auth-done {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 4px 0 6px;
+  font-size: 14px;
+}
+.done-mark {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: #e8f6ee; color: var(--ok);
+  display: grid; place-items: center;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+@media (max-width: 560px) {
+  .copy-row { flex-wrap: nowrap; }
+}
 
 .toast {
   position: fixed;

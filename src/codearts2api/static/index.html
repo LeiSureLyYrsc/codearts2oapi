@@ -50,10 +50,10 @@
               <p class="muted">对话按策略轮换 / 故障转移；每日签到会对每个已启用账号分别执行。</p>
             </div>
             <div class="actions">
+              <button type="button" class="btn primary" id="btn-add-oauth">连接 OAuth 账号</button>
+              <button type="button" class="btn" id="btn-add-aksk">添加 AK/SK 账号</button>
               <button type="button" class="btn" id="btn-import-auth">导入 Auth 文件</button>
               <input type="file" id="auth-files" accept=".json,application/json" multiple hidden>
-              <button type="button" class="btn" id="btn-add-aksk">添加 AK/SK 账号</button>
-              <button type="button" class="btn primary" id="btn-add-oauth">添加 OAuth 账号</button>
             </div>
           </div>
           <div class="table-wrap">
@@ -183,21 +183,72 @@
     </form>
   </dialog>
 
-  <dialog id="login-dialog">
+  <dialog id="login-dialog" class="auth-dialog" aria-labelledby="login-title">
     <div class="dialog-body">
-      <h3>OAuth 登录</h3>
-      <p class="muted">在能访问本机 127.0.0.1 的浏览器中打开授权地址，登录华为云并确认授权。</p>
-      <p><strong>账号：</strong> <span id="oauth-account-label"></span></p>
-      <p><strong>状态：</strong> <span id="oauth-status">准备中</span></p>
-      <p class="break-all" id="oauth-url-wrap" hidden>
-        <strong>授权地址：</strong><br>
-        <a id="oauth-url" href="#" target="_blank" rel="noopener"></a>
-      </p>
-      <p class="muted" id="oauth-callback"></p>
-      <div class="actions">
-        <button type="button" class="btn" id="btn-copy-url">复制授权地址</button>
-        <button type="button" class="btn ghost" id="btn-login-close">关闭</button>
+      <div class="dialog-head">
+        <div>
+          <h3 id="login-title">连接 CodeArts 账号</h3>
+          <p class="muted dialog-sub" id="login-subtitle">先授权，成功后再写入账号池。</p>
+        </div>
+        <button type="button" class="btn ghost icon" id="btn-login-close" aria-label="关闭">×</button>
       </div>
+
+      <section id="login-step-details" class="auth-step">
+        <form id="login-start-form">
+          <label>账号名称 <input name="name" required maxlength="80" placeholder="例如：上班 / 个人" autocomplete="off"></label>
+          <label>备注（可选） <input name="note" maxlength="200" autocomplete="off"></label>
+          <label class="check"><input name="enabled" type="checkbox" checked> 授权成功后立即启用</label>
+          <p id="login-start-error" class="error hidden"></p>
+          <div class="actions">
+            <button type="button" class="btn ghost" id="btn-login-cancel-start">取消</button>
+            <button type="submit" class="btn primary">开始授权</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="login-step-auth" class="auth-step hidden">
+        <ol class="auth-steps">
+          <li>打开下面的授权地址，登录华为云并确认授权。</li>
+          <li>授权成功后，如果这台浏览器能访问到网关的本机回调地址，这里会自动完成连接。</li>
+          <li>否则浏览器会显示「无法访问此网站 / 拒绝连接」：此时地址栏里那条完整地址就是回调地址，把它整条复制下来，粘贴到下方提交。</li>
+        </ol>
+
+        <div class="field-block">
+          <span class="field-label">授权地址</span>
+          <div class="copy-row">
+            <input id="authorize-url" readonly spellcheck="false" aria-label="授权地址" placeholder="正在获取授权地址…">
+            <button type="button" class="btn" id="btn-copy-url" disabled>复制</button>
+          </div>
+          <div class="actions compact">
+            <a id="oauth-open-link" class="btn small hidden" href="#" target="_blank" rel="noopener">在新标签页打开</a>
+          </div>
+        </div>
+
+        <form id="callback-form" class="field-block">
+          <label for="callback-url-input">浏览器跳转失败时，粘贴地址栏里的完整回调地址</label>
+          <div class="copy-row">
+            <input id="callback-url-input" name="callback_url" placeholder="http://127.0.0.1:端口/oauth/callback?code=..." autocomplete="off" spellcheck="false">
+            <button type="submit" class="btn" id="btn-submit-callback" disabled>提交回调</button>
+          </div>
+          <p class="muted small">必须带上 <code>?</code> 后面的全部参数（<code>code=</code> 或 <code>secret=</code>），只复制到 <code>/oauth/callback</code> 会失败。这条地址等同一次登录凭证，不要发给别人。</p>
+          <p id="callback-error" class="error hidden" role="alert"></p>
+        </form>
+
+        <p class="auth-status" role="status" aria-live="polite"><span class="dot" aria-hidden="true"></span><span id="oauth-status">等待授权…</span></p>
+        <p id="auth-error" class="error hidden" role="alert"></p>
+        <div class="actions">
+          <button type="button" class="btn ghost" id="btn-login-retry" hidden>重新开始授权</button>
+          <button type="button" class="btn ghost" id="btn-login-cancel">取消本次授权</button>
+        </div>
+      </section>
+
+      <section id="login-step-done" class="auth-step hidden">
+        <p class="auth-done"><span class="done-mark" aria-hidden="true">✓</span> 已连接 <strong id="login-done-name">账号</strong>，凭证已保存到本机。</p>
+        <p class="muted" id="login-done-detail"></p>
+        <div class="actions">
+          <button type="button" class="btn primary" id="btn-login-done">完成</button>
+        </div>
+      </section>
     </div>
   </dialog>
 

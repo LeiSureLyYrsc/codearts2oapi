@@ -95,7 +95,7 @@ https://snap-access.cn-north-4.myhuaweicloud.com
    - 带 `code`：`POST https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens`，表单为 `client_id`、`code`、`code_verifier`、`grant_type=authorization_code`、`redirect_uri=http://127.0.0.1:<port>/oauth/callback`，请求头带 `DPoP`。响应中的 `credentials`（`access_key_id` / `secret_access_key` / `security_token` / `expiration`）以及 `refresh_token` 为可用的临时凭证。
 6. 之后用同一把 DPoP 私钥和 `grant_type=refresh_token` 调用同一令牌地址续期（可带 `x-agent-user-account`）。临时凭证及刷新令牌写入该账号的 `data/accounts/<id>.json`（Unix 权限 0600），**不要提交到仓库**。过期前约 10 分钟会自动刷新（与官方 CLI 的 600_000 ms 偏差一致）。
 
-门户回调地址被官方客户端写成环回地址，因此授权必须在能访问本机 `127.0.0.1:<port>` 的浏览器中完成。在远程服务器上登录时，请在自己电脑上做 SSH 本地端口转发，或直接在有浏览器的那台机器上执行 `uv run codearts2api login`。`--print-only` 只是不自动打开浏览器、把授权 URL 打印出来，仍然在本机等待回调。
+门户回调地址是环回地址。WebUI 支持自动接收回调；如果远程部署时浏览器无法访问该地址，也可以把授权后地址栏里的**完整回调地址**粘贴回 WebUI，无需转发回调端口。CLI 的 `uv run codearts2api login` 则仍需能访问回调端口，可在有浏览器的机器上执行，或使用 SSH 本地端口转发。`--print-only` 只负责打印授权链接，CLI 仍会等待本机回调。
 
 `settings.credential_source`（默认 `auto`）用来筛选账号池类型：`auto` 使用全部启用账号，`oauth` 只用 OAuth 账号，`aksk` 只用 AK/SK 账号（旧值 `env` 仍被接受，并按 `aksk` 处理）。对话使用的具体账号由账号池策略决定（默认 `round_robin`，也可选 `first_available` 或 `random`）。
 
@@ -153,7 +153,7 @@ uv run codearts2api serve --host 127.0.0.1 --port 8787
 
 如果反向代理把网关发布在 `/gateway/` 之类的子路径下，请让代理转发时去掉 `/gateway`，并为 ASGI 服务配置同一个 `root_path`（例如 `uv run uvicorn codearts2api.app:app --port 8787 --root-path /gateway`）。浏览器应访问 `/gateway/`（保留末尾斜杠）；静态资源、管理 API 和旧 `/ui` 入口都会保留此前缀。
 
-页面本身不用带密钥；进入后在登录表单填写 `CA2A_API_KEY`，浏览器只把它存在 sessionStorage，并以 `Authorization: Bearer` 调用管理接口。在「账号池」里可以再添加第二个 AK/SK 或 OAuth 账号。OAuth 回调仍然是官方客户端同款的 `http://127.0.0.1:<port>/oauth/callback`，浏览器必须能访问这台机器的环回地址。
+页面本身不用带密钥；进入后在登录表单填写 `CA2A_API_KEY`，浏览器只把它存在 sessionStorage，并以 `Authorization: Bearer` 调用管理接口。在「账号池」里可以添加 AK/SK 或 OAuth 账号；OAuth 授权成功后账号才会保存。如果回调不能自动完成，可以在授权窗口粘贴浏览器地址栏里的完整回调地址。
 
 其他命令：`uv run codearts2api status`（列出账号池，不输出密钥）、`uv run codearts2api logout`（可加 `--account`）。
 
@@ -195,7 +195,7 @@ docker build -t ghcr.io/leisurelyyrsc/codearts2oapi:latest .
 docker compose up -d --pull never --force-recreate
 ```
 
-首次拉取需要仓库里的 Actions 至少成功跑完一次。GHCR 包的可见性独立于仓库；若新发布的镜像无法匿名拉取，请由包管理员在 GitHub Packages 设置中将包设为 public。`./data`（运行配置与每账号独立 Auth 文件）会挂载到容器中以保持持久化；`./auths` 挂载仅保留用于旧 OAuth 会话的兼容迁移。容器内的 OAuth 回调仍然指向容器自己的 127.0.0.1，通常需要在宿主机做端口转发，或在有浏览器的机器上用 CLI 登录，然后在 WebUI 导出 Auth 文件并在容器的 WebUI 导入。
+首次拉取需要仓库里的 Actions 至少成功跑完一次。GHCR 包的可见性独立于仓库；若新发布的镜像无法匿名拉取，请由包管理员在 GitHub Packages 设置中将包设为 public。`./data`（运行配置与每账号独立 Auth 文件）会挂载到容器中以保持持久化；`./auths` 挂载仅保留用于旧 OAuth 会话的兼容迁移。Docker 部署不必额外映射 OAuth 回调端口：浏览器跳到本机地址后，把地址栏里的完整回调地址粘贴回发起授权的 WebUI 即可。
 
 ## 配置说明
 
@@ -247,9 +247,9 @@ config 不再包含 `accounts`、AK/SK、`security_token` 或 `project_id`。这
 ## 多号池与 WebUI
 
 1. 打开 http://127.0.0.1:8787/ ，输入 `CA2A_API_KEY`。
-2. 在「账号池」中添加第二个账号：AK/SK 直接填写密钥；OAuth 账号保存后再点「OAuth 登录」，在能访问 `127.0.0.1` 的浏览器里打开授权地址。
+2. 在「账号池」中添加账号：AK/SK 直接填写密钥并保存；也可以点「连接 OAuth 账号」，填写名称后去华为云授权，授权成功才会添加。如果授权页跳转到 `127.0.0.1` 或 `localhost` 后显示「无法访问」，请从浏览器地址栏复制**完整地址（含 `?` 后的参数）**，粘贴回原来的授权窗口。回调含一次性凭证，请勿转发或分享。
 3. 「签到与状态」可对全部或单个账号触发每日签到 / 权益领取，并查看调度器的下次运行时间。上次签到结果会写入对应的 `data/accounts/<id>.json`，重启后仍可在页面看到。
-4. 管理接口：`GET/PUT /admin/config`，`GET/POST /admin/accounts`，`PATCH/DELETE /admin/accounts/{id}`，`POST /admin/accounts/{id}/login`，`POST /admin/accounts/{id}/test`（用已有的官方套餐统计路径做探测）。普通管理响应中的 SK / security_token / refresh_token / 完整 AK 一律脱敏；显式的 Auth 导出接口是例外，会返回完整凭证。
+4. 管理接口：`GET/PUT /admin/config`，`GET/POST /admin/accounts`（直接添加仅支持 AK/SK），`PATCH/DELETE /admin/accounts/{id}`，`POST /admin/accounts/{id}/test`（探测套餐统计）。OAuth 用 `POST /admin/login/start`（`{name, enabled?, note?}`）发起新增，或 `POST /admin/accounts/{id}/login` 为已有账号重新授权。用返回的 `login_id` 查询 `GET /admin/login/status?login_id=…` 或通过 `DELETE /admin/login?login_id=…` 取消；手动回调则向 `POST /admin/login/callback` 提交 `{login_id, callback_url}`。普通管理响应中的 SK / security_token / refresh_token / 完整 AK 一律脱敏；显式的 Auth 导出接口是例外，会返回完整凭证。
 
 ## Auth 文件：每账号单文件、导入与导出
 
@@ -298,9 +298,10 @@ curl -s http://127.0.0.1:8787/healthz
 受保护接口需要 `Authorization: Bearer <CA2A_API_KEY>`。
 
 ```bash
-# 通过网关发起官方浏览器登录（返回授权 URL；回调仍在网关进程的 127.0.0.1）
-curl -s http://127.0.0.1:8787/admin/login   -H "Authorization: Bearer $CA2A_API_KEY"
-curl -s http://127.0.0.1:8787/admin/login/status   -H "Authorization: Bearer $CA2A_API_KEY"
+# 发起 OAuth 授权；打开返回的 authorize_url，成功后才添加账号
+curl -s http://127.0.0.1:8787/admin/login/start   -H "Authorization: Bearer $CA2A_API_KEY"   -H "Content-Type: application/json"   -d '{"name":"工作账号"}'
+# 将 LOGIN_ID 替换为上一步返回的 login_id
+curl -s "http://127.0.0.1:8787/admin/login/status?login_id=LOGIN_ID"   -H "Authorization: Bearer $CA2A_API_KEY"
 
 curl -s http://127.0.0.1:8787/v1/models   -H "Authorization: Bearer $CA2A_API_KEY"
 curl -s "http://127.0.0.1:8787/v1/models?refresh=true"   -H "Authorization: Bearer $CA2A_API_KEY"

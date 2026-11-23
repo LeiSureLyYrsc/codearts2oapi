@@ -3,6 +3,10 @@ services:
     image: ghcr.io/leisurelyyrsc/codearts2oapi:latest
     pull_policy: always
     container_name: codearts2api
+    # Run as the unprivileged app user (UID/GID 1000 in the image). Override
+    # CA2A_UID/CA2A_GID in your shell or .env when the host bind dirs are
+    # owned by another non-root user, so auths/ and data/ stay writable.
+    user: "${CA2A_UID:-1000}:${CA2A_GID:-1000}"
     ports:
       - "127.0.0.1:8787:8787"
     env_file:

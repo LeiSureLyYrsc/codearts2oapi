@@ -176,6 +176,16 @@ docker compose pull
 docker compose up -d
 ```
 
+Compose 默认以 `1000:1000` 运行网关，可在部署目录的 `.env` 中设置 `CA2A_UID` / `CA2A_GID`。它们只改变容器进程的身份，不会修改宿主机权限。若 Linux 上报 `PermissionError: ... '/app/data/accounts'`，请用拥有数据目录的普通用户运行 `id -u` 和 `id -g`，将结果填入 `.env`，并确保该用户能写入 `./data`、`./auths` 及其中现有文件。首次部署应先用该用户执行 `mkdir -p data auths`，再启动 Compose，避免 Docker 自动创建 root 所有的目录。
+
+如果这两个目录已经由 root 创建，可在 Docker 宿主机上将它们移交给你配置的 UID/GID（下面以默认值为例；使用自定义值时替换 `1000:1000`）。无需清空目录，也不必把容器改成 root：
+
+```bash
+sudo chown -hR -- 1000:1000 ./data ./auths
+docker compose pull
+docker compose up -d --force-recreate
+```
+
 如果之前 `/ui` 或 `/` 无法打开，请先确认部署的是本仓库发布的 `ghcr.io/leisurelyyrsc/codearts2oapi:latest`，而不是旧的 `codearts2api` 镜像；更新 compose 后执行上面的 pull / up 命令重建容器。源码启动则更新代码后重启进程。若 `/` 返回 `WebUI is not packaged`，请重装完整的 Python 包或重新构建镜像；若 `/` 返回页面但按钮不可用或没有样式，请检查同一访问前缀下的 `static/app.js` 和 `static/styles.css` 是否都能返回相应文件（不应是 404 或 HTML）。Docker 构建会校验已安装的这三个 WebUI 文件。
 
 要在修复发布前用当前源码验证镜像，可以本地构建，并让 Compose 不拉取远程标签：

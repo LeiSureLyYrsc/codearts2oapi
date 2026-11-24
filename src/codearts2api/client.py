@@ -6,7 +6,7 @@ import json
 import logging
 import uuid
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin
 
 import httpx
 
@@ -196,7 +196,10 @@ class SnapAccessClient:
         )
 
     async def post_chat(self, payload: dict[str, Any], credential: ResolvedCredential | None = None) -> Any:
-        body, _status = await self.request_json("POST", CHAT_PATH, payload=payload, credential=credential)
+        body, _status = await self.request_json(
+            "POST", CHAT_PATH, payload=payload, credential=credential,
+            headers=_chat_headers(payload), sign_language=True,
+        )
         return body
 
     def stream_chat(self, payload: dict[str, Any], credential: ResolvedCredential | None = None) -> httpx.Response:
@@ -204,7 +207,10 @@ class SnapAccessClient:
         body = json_body(payload)
         url = self._build_url(CHAT_PATH)
         cred = self._credential(credential)
-        headers = self.sign("POST", url, body=body, credential=cred)
+        headers = self.sign(
+            "POST", url, body=body, headers=_chat_headers(payload), credential=cred,
+            sign_language=True,
+        )
         headers.setdefault("Accept", "text/event-stream")
         timeout = httpx.Timeout(
             connect=self._settings.http_timeout,
@@ -293,6 +299,20 @@ def _error_message(payload: Any, status_code: int) -> str:
             value = payload.get(key)
             if isinstance(value, str) and value:
                 return value
-            if isinstance(value, dict) and isinstance(value.get("message"), str):
-                return value["message"]
+            if isinstance(value, dict):
+                nested = _error_message(value, status_code)
+                if nested != f"Upstream request failed with HTTP {status_code}":
+                    return nested
     return f"Upstream request failed with HTTP {status_code}"
+
+
+def _chat_headers(payload: dict[str, Any]) -> dict[str, str]:
+    headers = {"x-snap-traceid": uuid.uuid4().hex}
+    for field in ("model", "model_id", "model-id"):
+        value = payload.get(field)
+        if value is not None and str(value):
+            encoded = quote(str(value), safe="-_.~")
+            headers["model-id"] = encoded
+            headers["model-name"] = encoded
+            break
+    return headers

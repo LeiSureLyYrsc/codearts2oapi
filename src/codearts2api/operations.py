@@ -14,7 +14,7 @@ from codearts2api.checkin import (
     is_credit_account,
     run_checkin,
 )
-from codearts2api.client import SnapAccessClient, UpstreamError
+from codearts2api.client import SnapAccessClient, UpstreamError, _error_message
 from codearts2api.credentials import CredentialResolver, ResolvedCredential
 from codearts2api.pool import Account, AccountPool, is_failover_status, now_in_timezone
 
@@ -374,21 +374,16 @@ async def open_chat_stream_with_failover(
         except Exception as exc:  # noqa: BLE001
             await _close_cm(stream_cm, exc)
             raise
-        if response.status_code >= 400:
-            raw = await response.aread()
+        if not 200 <= response.status_code < 300:
             try:
-                import json
-
-                parsed = json.loads(raw.decode("utf-8")) if raw else None
-            except ValueError:
-                parsed = raw.decode("utf-8", errors="replace") if raw else None
-            message = str(parsed) if not isinstance(parsed, dict) else (
-                parsed.get("message")
-                or (parsed.get("error") or {}).get("message")
-                or f"Upstream stream failed with HTTP {response.status_code}"
-            )
+                raw = await response.aread()
+                parsed = _parse_stream_error(raw, response.headers.get("content-type", ""))
+                message = _error_message(parsed, response.status_code)
+            except Exception:
+                await _close_cm(stream_cm)
+                raise
             await _close_cm(stream_cm)
-            err = UpstreamError(str(message), response.status_code, parsed)
+            err = UpstreamError(message, response.status_code, parsed)
             last_error = err
             if is_failover_status(response.status_code):
                 pool.mark_cooldown(account.id, response.status_code)
@@ -405,6 +400,32 @@ async def open_chat_stream_with_failover(
     if last_error is not None:
         raise last_error
     raise UpstreamError("No healthy accounts available in the pool", 503)
+
+
+def _parse_stream_error(raw: bytes, content_type: str) -> Any:
+    """Parse JSON or a compact SSE JSON error; never expose arbitrary response text."""
+    import json
+
+    if not raw:
+        return None
+    text = raw.decode("utf-8", errors="replace").strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    if "event-stream" in content_type.lower() or text.startswith(("data:", "event:")):
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data and data != "[DONE]":
+                try:
+                    value = json.loads(data)
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    return value
+    return None
 
 
 async def list_models_with_failover(

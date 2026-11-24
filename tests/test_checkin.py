@@ -90,9 +90,32 @@ def test_select_campaigns_defaults_to_daily_claim() -> None:
     )
     assert select_campaigns(campaigns) == [DAILY]
     assert select_campaigns(campaigns, campaign_type="USER_LOGIN") == [DAILY]
+    assert select_campaigns([{**DAILY, "type": " daily_claim "}], campaign_type=" user_login ")
 
     all_claimable = select_campaigns(campaigns, campaign_type="USER_LOGIN", all_claimable=True)
     assert {c["campaignId"] for c in all_claimable} == {"camp-login", "login-event", "other"}
+
+
+@pytest.mark.parametrize(
+    ("delivery", "status", "expected_message"),
+    [
+        ({"code": 0, "data": {"items": []}}, "no_campaign", "empty activity list (looking for DAILY_CLAIM)"),
+        (
+            {"code": 0, "data": {"items": [{"campaignId": "not-for-output", "type": "USER_LOGIN"}]}},
+            "no_campaign",
+            "No matching campaign for DAILY_CLAIM in 1 upstream activities; USER_LOGIN is a separate activity",
+        ),
+        ({"code": 0, "data": {"items": {}}}, "error", "Unexpected activity response format"),
+        ({"code": 0, "data": {"items": [None]}}, "error", "Unexpected activity response format"),
+    ],
+)
+async def test_unmatched_delivery_is_diagnostic_without_claiming(delivery, status, expected_message):
+    transport = FakeTransport(plugin=CREDIT, activities=delivery)
+    result = await run_checkin(transport, campaign_type="USER_LOGIN")
+    assert result.status == status
+    assert expected_message in result.message
+    assert "not-for-output" not in result.message
+    assert result.actions == transport.claim_calls == transport.confirm_calls == []
 
 
 def test_claimable_and_already_claimed_flags() -> None:

@@ -113,6 +113,8 @@ https://snap-access.cn-north-4.myhuaweicloud.com
 
 签到复用账号已有的 CLI OAuth 临时 AK/SK 和安全令牌（或该账号配置的 AK/SK），不读取桌面端凭据。如果额度和模型可查询，但活动请求仍被上游拒绝，请通过官方桌面端或[门户](https://codearts.huaweicloud.com/portal)的「活动福利 → 每日领取」手动签到。若其他请求也提示会话过期，先在账号池「重新授权」。
 
+若返回 `no_campaign`，不代表今日已领取。请用同一账号在官方桌面端或门户查看「每日领取」是可领取、已领取，还是未显示；积分计费的企业套餐不在本活动范围内。不要为排查勾选「同时领取其他可领取活动」，以免领取到其他活动。
+
 定时签到使用进程内 APScheduler，时区默认 `Asia/Shanghai`，默认每天 08:00，启动时默认也会执行一次。如果活动已经标记为领取或确认，网关不会再次发送领取请求。
 
 限时模型权益与每日签到分开：`POST /admin/benefit-claim` 按官方 CLI 调用 opengw 的 `/api/v1/benefit/claim`。

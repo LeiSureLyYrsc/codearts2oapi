@@ -18,7 +18,12 @@ from codearts2api.checkin import (
 )
 from codearts2api.client import SnapAccessClient, UpstreamError, _error_message, chat_error_status
 from codearts2api.credentials import CredentialResolver, ResolvedCredential
-from codearts2api.pool import Account, AccountPool, is_failover_status, now_in_timezone
+from codearts2api.pool import (
+    Account,
+    AccountPool,
+    is_failover_status,
+    now_in_timezone,
+)
 
 if TYPE_CHECKING:
     from codearts2api.chat_concurrency import ChatRequestTicket
@@ -313,10 +318,11 @@ async def post_chat_with_failover(
     payload: dict[str, Any],
     session_id: str | None = None,
     ticket: ChatRequestTicket | None = None,
+    candidates: list[Account] | None = None,
 ) -> Any:
     last_error: UpstreamError | None = None
     busy = False
-    for account in pool.iter_candidates():
+    for account in candidates if candidates is not None else pool.iter_candidates():
         if ticket is not None and not ticket.bind(account.id, account.chat_concurrency_limit):
             busy = True
             continue
@@ -365,11 +371,12 @@ async def open_chat_stream_with_failover(
     payload: dict[str, Any],
     session_id: str | None = None,
     ticket: ChatRequestTicket | None = None,
+    candidates: list[Account] | None = None,
 ):
     """Return (stream_cm, response) for the first account that accepts the stream."""
     last_error: UpstreamError | None = None
     busy = False
-    for account in pool.iter_candidates():
+    for account in candidates if candidates is not None else pool.iter_candidates():
         if ticket is not None and not ticket.bind(account.id, account.chat_concurrency_limit):
             busy = True
             continue

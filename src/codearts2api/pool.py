@@ -679,16 +679,28 @@ class AccountPool:
         setup is not hard-blocked until the cooldown expires.
         """
         with self._lock:
-            kinds = allowed_kinds(self.settings.credential_source)
-            enabled = [
-                account for account in self.accounts
-                if account.enabled and (kinds is None or account.kind in kinds)
-            ]
-            healthy = [account for account in enabled if not self.in_cooldown(account.id)]
-            chosen = healthy or enabled
-            return self._order(chosen)
+            return self._order(self._selectable(), advance=True)
 
-    def _order(self, accounts: list[Account]) -> list[Account]:
+    def peek_candidates(self) -> list[Account]:
+        """Selectable accounts in pool order, without touching the strategy.
+
+        Used to decide whether capacity exists before claiming it. Deliberately
+        unordered: it must not advance the round-robin cursor or consume RNG
+        draws, because queued requests re-check it on every wake-up.
+        """
+        with self._lock:
+            return self._selectable()
+
+    def _selectable(self) -> list[Account]:
+        kinds = allowed_kinds(self.settings.credential_source)
+        enabled = [
+            account for account in self.accounts
+            if account.enabled and (kinds is None or account.kind in kinds)
+        ]
+        healthy = [account for account in enabled if not self.in_cooldown(account.id)]
+        return healthy or enabled
+
+    def _order(self, accounts: list[Account], *, advance: bool = True) -> list[Account]:
         if not accounts:
             return []
         strategy = self.settings.pool_strategy
@@ -700,7 +712,8 @@ class AccountPool:
             return shuffled
         n = len(accounts)
         start = self._rr_index % n
-        self._rr_index = (start + 1) % n
+        if advance:
+            self._rr_index = (start + 1) % n
         return accounts[start:] + accounts[:start]
 
     def update_runtime_settings(self, updates: dict[str, Any]) -> dict[str, Any]:

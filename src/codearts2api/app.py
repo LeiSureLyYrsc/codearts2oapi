@@ -30,7 +30,13 @@ from codearts2api.chat import (
     normalize_completion,
     openai_error,
 )
-from codearts2api.chat_concurrency import ChatConcurrency, ChatConcurrencyMiddleware
+from codearts2api.chat_concurrency import (
+    Capacity,
+    ChatConcurrency,
+    ChatConcurrencyMiddleware,
+    QueueResult,
+    wait_for_capacity_or_disconnect,
+)
 from codearts2api.chat_request import ChatPayloadError, custom_tool_aliases, prepare_chat_payload
 from codearts2api.chat_tool_response import CustomToolStream, restore_completion_tools
 from codearts2api.client import SnapAccessClient, UpstreamError, chat_error_status, upstream_error_code
@@ -55,7 +61,7 @@ from codearts2api.operations import (
     run_benefit_claim_for_accounts,
     run_checkin_for_accounts,
 )
-from codearts2api.pool import AccountPool, collect_redaction_secrets
+from codearts2api.pool import Account, AccountPool, collect_redaction_secrets
 from codearts2api.scheduler import CheckinScheduler
 from codearts2api.oauth.session import SESSION_FILENAME
 from codearts2api.schemas import (
@@ -79,6 +85,28 @@ def _chat_session_id(request: Request) -> str | None:
         if CHAT_SESSION_ID.fullmatch(value):
             return value
     return None
+
+
+def _chat_queue_error(result: QueueResult) -> JSONResponse:
+    """OpenAI-shaped error for a queued request that never got to run."""
+    if result is QueueResult.QUEUE_FULL:
+        return JSONResponse(status_code=429, content=openai_error("Gateway chat request queue is full", 429))
+    if result is QueueResult.NO_CAPACITY:
+        return JSONResponse(
+            status_code=503,
+            content=openai_error(
+                "No enabled accounts in the pool. Add an AK/SK account in the WebUI "
+                "or import an account auth file, or run `uv run codearts2api login`.",
+                503,
+            ),
+        )
+    if result is QueueResult.DISCONNECTED:
+        # The middleware drops response messages once a disconnect was seen, so
+        # the client never receives this status; it only needs a valid response.
+        return JSONResponse(status_code=499, content=openai_error("Client disconnected while waiting", 499))
+    return JSONResponse(
+        status_code=429, content=openai_error("Timed out waiting for an available chat request slot", 429),
+    )
 
 # Retain finished login results so status polling and a duplicate submit never
 # consume each other's success, then forget them.
@@ -416,8 +444,57 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ):
         runtime = _state(request)
         ticket = request.state.chat_request
-        if not ticket.admit(runtime.settings.chat_concurrency_limit):
-            return JSONResponse(status_code=429, content=openai_error("Gateway chat request concurrency limit reached", 429))
+        concurrency = runtime.chat_concurrency
+        attempt_candidates: list[Account] = []
+
+        def global_limit_reached(limit: int) -> bool:
+            return limit > 0 and concurrency.active_count() >= limit
+
+        # Reject new arrivals at the global cap; only account saturation queues.
+        if global_limit_reached(runtime.settings.chat_concurrency_limit):
+            return JSONResponse(
+                status_code=429,
+                content=openai_error("Gateway chat request concurrency limit reached", 429),
+            )
+
+        def reserve() -> Capacity:
+            """Admit this request, or say why it cannot run yet.
+
+            The global limit is re-read on every call so a limit change reaches
+            already-queued requests. Readiness comes from ``peek_candidates``,
+            which is unordered and side-effect free; the rotation-advancing
+            order is fetched once, only when a slot is actually claimed.
+            """
+            global_limit = runtime.settings.chat_concurrency_limit
+            if ticket.account_id is not None:
+                return Capacity.READY
+            if global_limit_reached(global_limit):
+                return Capacity.BUSY
+            selectable = runtime.pool.peek_candidates()
+            if not selectable:
+                return Capacity.UNAVAILABLE
+            free_ids = {
+                account.id for account in selectable
+                if account.chat_concurrency_limit <= 0
+                or concurrency.active_count(account.id) < account.chat_concurrency_limit
+            }
+            if not free_ids:
+                return Capacity.BUSY
+            # Take the first idle account in the official order, so a busy
+            # preferred account is skipped rather than waited for, and rotation
+            # advances once per admitted request.
+            ordered = runtime.pool.iter_candidates()
+            preferred = next((account for account in ordered if account.id in free_ids), None)
+            if preferred is None:  # pragma: no cover - peek and order agree above
+                return Capacity.BUSY
+            if not ticket.try_reserve(global_limit, lambda: [(preferred.id, preferred.chat_concurrency_limit)]):
+                return Capacity.BUSY
+            attempt_candidates[:] = [preferred, *[account for account in ordered if account.id != preferred.id]]
+            return Capacity.READY
+
+        result = await wait_for_capacity_or_disconnect(ticket, reserve, request.receive)
+        if result is not QueueResult.ACQUIRED:
+            return _chat_queue_error(result)
         if not runtime.resolver.has_any():
             require_upstream_credentials(current_settings)
         model = strip_codearts_prefix(body.model)
@@ -439,6 +516,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     payload=upstream_payload,
                     session_id=session_id,
                     ticket=ticket,
+                    candidates=attempt_candidates or None,
                 )
             except UpstreamError as exc:
                 status = exc.status_code if 400 <= exc.status_code < 600 else 502
@@ -476,6 +554,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     ),
                 )
             events = _chat_stream_events(response)
+            resources = _ChatStreamResources(stream_cm, events)
             handoff = False
             try:
                 # InferHub also returns request errors as the first event of a
@@ -500,16 +579,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             finally:
                 if not handoff:
-                    await events.aclose()
-                    await _close_chat_response(stream_cm)
-            return StreamingResponse(
-                _stream_chat(stream_cm, events, first, model, aliases),
+                    await resources.aclose()
+            return _ChatStreamingResponse(
+                _stream_chat(resources, events, first, model, aliases),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
                 },
+                resources=resources,
             )
 
         try:
@@ -520,6 +599,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 payload=upstream_payload,
                 session_id=session_id,
                 ticket=ticket,
+                candidates=attempt_candidates or None,
             )
         except UpstreamError as exc:
             return JSONResponse(
@@ -725,6 +805,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _retire_login(runtime, attempt, status="logged_in", message=None, account_id=account_id)
         runtime.model_cache.clear()
         refresh_logging(runtime.settings, runtime.pool)
+        # A new or reauthorized account changes who may run next, like any other
+        # account write.
+        runtime.chat_concurrency.notify()
         logger.info("OAuth login completed login_id=%s account_id=%s", attempt.login_id, account_id)
 
     def _lookup_finished(runtime: AppState, login_id: str) -> LoginResult | None:
@@ -1108,6 +1191,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             previous_timezone=previous_timezone,
             previous_scheduler_enabled=previous_scheduler_enabled,
         )
+        # A raised global limit creates capacity for requests already waiting.
+        runtime.chat_concurrency.notify()
         return payload
 
     @protected.get("/admin/accounts")
@@ -1152,6 +1237,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         refresh_logging(runtime.settings, runtime.pool)
+        runtime.chat_concurrency.notify()
         return runtime.public_account(account)
 
     @protected.post("/admin/accounts/import")
@@ -1174,6 +1260,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             detail = "Invalid auth JSON" if isinstance(exc, (json.JSONDecodeError, UnicodeError)) else str(exc)
             raise HTTPException(status_code=400, detail=detail) from None
         refresh_logging(runtime.settings, runtime.pool)
+        runtime.chat_concurrency.notify()
         return {"accounts": [runtime.public_account(a) for a in accounts]}
 
     @protected.get("/admin/accounts/{account_id}/export")
@@ -1201,6 +1288,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         refresh_logging(runtime.settings, runtime.pool)
+        # An edited limit or re-enabled account changes who may run next.
+        runtime.chat_concurrency.notify()
         return runtime.public_account(account)
 
     @protected.delete("/admin/accounts/{account_id}")
@@ -1210,6 +1299,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             runtime.pool.delete_account(account_id)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"Account not found: {account_id}") from None
+        runtime.chat_concurrency.notify()
         return {"ok": True, "id": account_id}
 
     @protected.post("/admin/accounts/{account_id}/test")
@@ -1317,6 +1407,61 @@ async def _close_chat_response(stream_cm: Any) -> None:
         logger.debug("Failed to close chat response", exc_info=True)
 
 
+class _ChatStreamResources:
+    """Idempotent owner of one opened upstream chat stream.
+
+    Both the SSE generator's ``finally`` and the response wrapper close this, so
+    an aborted send or a generator that was never iterated still releases the
+    upstream response exactly once, before the request's concurrency slot goes
+    back to the queue.
+    """
+
+    def __init__(self, stream_cm: Any, events: AsyncGenerator[dict[str, Any] | str, None]) -> None:
+        self.stream_cm = stream_cm
+        self.events = events
+        self._closed = False
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self.events.aclose()
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to close the chat event stream", exc_info=True)
+        finally:
+            await _close_chat_response(self.stream_cm)
+
+
+class _ChatStreamingResponse(StreamingResponse):
+    """StreamingResponse that closes its upstream stream before returning.
+
+    Starlette does not call ``aclose`` on an async ``body_iterator`` when the
+    send side is cancelled or fails; the generator would then stay suspended at
+    a ``yield`` and its ``finally`` would not run until garbage collection, so
+    the request would keep its concurrency slot after the client is gone. The
+    shielded close here runs while unwinding, still inside the middleware, so
+    the slot is returned only after the upstream stream has really closed.
+    """
+
+    def __init__(self, *args: Any, resources: _ChatStreamResources, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._resources = resources
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                aclose = getattr(self.body_iterator, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("Failed to close the chat stream generator", exc_info=True)
+                await self._resources.aclose()
+
+
 async def _chat_stream_events(response: httpx.Response) -> AsyncGenerator[dict[str, Any] | str, None]:
     """Read SSE events (and bare NDJSON records) without committing downstream headers."""
     data_lines: list[str] = []
@@ -1345,8 +1490,8 @@ async def _chat_stream_events(response: httpx.Response) -> AsyncGenerator[dict[s
 
 
 async def _stream_chat(
-    stream_cm: Any, events: AsyncGenerator[dict[str, Any] | str, None], first: dict[str, Any] | str, model: str,
-    aliases: dict[str, str],
+    resources: _ChatStreamResources, events: AsyncGenerator[dict[str, Any] | str, None],
+    first: dict[str, Any] | str, model: str, aliases: dict[str, str],
 ):
     metadata: dict[str, Any] = {}
     finished: dict[int, str | None] = {}
@@ -1431,8 +1576,7 @@ async def _stream_chat(
     except ValueError:
         yield format_sse_json(openai_error("Malformed upstream stream data", 502))
     finally:
-        await events.aclose()
-        await _close_chat_response(stream_cm)
+        await resources.aclose()
 
 
 # Default app instance for ``uvicorn codearts2api.app:app`` / ``python -m codearts2api``.

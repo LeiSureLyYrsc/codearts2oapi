@@ -154,20 +154,21 @@ def account_type_label(payload: Any) -> str:
     return "token"
 
 
-def extract_campaigns(payload: Any) -> list[dict[str, Any]]:
+def extract_campaigns(payload: Any) -> list[dict[str, Any]] | None:
+    """Return the delivered campaigns; None means an unrecognized response."""
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        return payload if all(isinstance(item, dict) for item in payload) else None
     if not isinstance(payload, dict):
-        return []
-    for key in ("data", "result", "campaigns", "list", "records", "content", "items"):
+        return None
+    for key in ("items", "data", "result", "campaigns", "list", "records", "content"):
         value = payload.get(key)
         if isinstance(value, list):
-            return [item for item in value if isinstance(item, dict)]
+            return extract_campaigns(value)
         if isinstance(value, dict):
             nested = extract_campaigns(value)
-            if nested:
+            if nested is not None:
                 return nested
-    return []
+    return None
 
 
 def campaign_type_of(campaign: dict[str, Any]) -> str | None:
@@ -218,6 +219,12 @@ def is_claimable(campaign: dict[str, Any]) -> bool:
     return False
 
 
+def effective_campaign_type(configured_type: str) -> str:
+    normalized = configured_type.strip().upper()
+    # USER_LOGIN was the old default but is a different desktop activity.
+    return DAILY_CAMPAIGN_TYPE if normalized == "USER_LOGIN" else normalized
+
+
 def select_campaigns(
     campaigns: list[dict[str, Any]],
     *,
@@ -226,9 +233,7 @@ def select_campaigns(
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    requested_type = campaign_type.strip().upper()
-    if requested_type == "USER_LOGIN":
-        requested_type = DAILY_CAMPAIGN_TYPE  # previous default, not the separate desktop login activity
+    requested_type = effective_campaign_type(campaign_type)
     for campaign in campaigns:
         cid = campaign_id_of(campaign)
         key = str(cid) if cid is not None else repr(campaign)
@@ -239,7 +244,7 @@ def select_campaigns(
             if not is_claimable(campaign) and not is_already_claimed(campaign):
                 continue
         else:
-            if not typ or typ.upper() != requested_type:
+            if not typ or typ.strip().upper() != requested_type:
                 continue
         seen.add(key)
         selected.append(campaign)
@@ -408,6 +413,9 @@ async def run_checkin(
         delivery_code = extract_business_code(delivery)
         if delivery_code is not None:
             raise UpstreamError(_business_error(delivery, delivery_code), 200)
+        activities = extract_campaigns(delivery)
+        if activities is None:
+            raise ValueError("Unexpected activity response format")
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to list check-in activities")
         return CheckinResult(
@@ -419,19 +427,25 @@ async def run_checkin(
         )
 
     campaigns = select_campaigns(
-        extract_campaigns(delivery),
+        activities,
         campaign_type=campaign_type,
         all_claimable=all_claimable,
     )
     if not campaigns:
+        target = "all claimable activities" if all_claimable else effective_campaign_type(campaign_type)
+        if not activities:
+            message = f"Upstream returned an empty activity list (looking for {target})"
+        else:
+            message = f"No matching campaign for {target} in {len(activities)} upstream activities"
+            if not all_claimable and target == DAILY_CAMPAIGN_TYPE and any(
+                (campaign_type_of(activity) or "").strip().upper() == "USER_LOGIN" for activity in activities
+            ):
+                message += "; USER_LOGIN is a separate activity"
         return CheckinResult(
             status="no_campaign",
             account_type=label,
             is_credit_package=True,
-            message=(
-                f"No matching campaign found (type={campaign_type}, "
-                f"all_claimable={all_claimable})"
-            ),
+            message=message,
         )
 
     actions: list[CampaignAction] = []

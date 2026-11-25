@@ -105,6 +105,8 @@ https://snap-access.cn-north-4.myhuaweicloud.com
 
 `GET /v1/models` 从上游 `GET /v1/model/builtin` 动态拉取，默认缓存 60 秒，`?refresh=true` 可强制刷新。只对外暴露 `enable=true` 的模型；若存在 `display_enabled` 字段，也必须为 true。对话请求使用裸模型 id（例如 `GLM-5.2`）；若客户端传来 `codearts/` 前缀，会去掉后再转给上游。
 
+OpenCode 请使用 OpenAI 兼容供应商，将 `baseURL` 指向网关的 `/v1`，并为确实支持工具调用的模型启用 tools。网关会按模型转换 token 上限字段，并复用 OpenCode 提供的会话标识。若上游明确报「并发会话数已达上限」，请停止不用的会话后重试；网关不会换账号绕过此限制。
+
 ### 5. 每日签到
 
 官方活动「每日签到得积分」面向已升级积分计费的个人版用户。本网关会先查套餐：`package.is_credit_package === true` 视为积分账号，否则返回 `ineligible`，不领取。
@@ -112,6 +114,8 @@ https://snap-access.cn-north-4.myhuaweicloud.com
 流程为：查询套餐 → 从 `DESKTOP` 活动列表匹配 `DAILY_CLAIM` → 带活动 `campaignId` 和 `idempotentKey` 领取 → 若返回领取记录 ID（`data.id` 或 `data.userBenefitId`），用 `userBenefitId` 确认。已有配置中的 `USER_LOGIN` 会按 `DAILY_CLAIM` 处理；桌面端的 `USER_LOGIN` 活动与每日签到不同。已领取返回 `already_claimed`，不视为错误。
 
 签到复用账号已有的 CLI OAuth 临时 AK/SK 和安全令牌（或该账号配置的 AK/SK），不读取桌面端凭据。如果额度和模型可查询，但活动请求仍被上游拒绝，请通过官方桌面端或[门户](https://codearts.huaweicloud.com/portal)的「活动福利 → 每日领取」手动签到。若其他请求也提示会话过期，先在账号池「重新授权」。
+
+若返回 `no_campaign`，不代表今日已领取。请用同一账号在官方桌面端或门户查看「每日领取」是可领取、已领取，还是未显示；积分计费的企业套餐不在本活动范围内。不要为排查勾选「同时领取其他可领取活动」，以免领取到其他活动。
 
 定时签到使用进程内 APScheduler，时区默认 `Asia/Shanghai`，默认每天 08:00，启动时默认也会执行一次。如果活动已经标记为领取或确认，网关不会再次发送领取请求。
 

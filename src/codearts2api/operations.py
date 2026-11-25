@@ -14,7 +14,7 @@ from codearts2api.checkin import (
     is_credit_account,
     run_checkin,
 )
-from codearts2api.client import SnapAccessClient, UpstreamError
+from codearts2api.client import SnapAccessClient, UpstreamError, _error_message, chat_error_status
 from codearts2api.credentials import CredentialResolver, ResolvedCredential
 from codearts2api.pool import Account, AccountPool, is_failover_status, now_in_timezone
 
@@ -309,6 +309,7 @@ async def post_chat_with_failover(
     resolver: CredentialResolver,
     pool: AccountPool,
     payload: dict[str, Any],
+    session_id: str | None = None,
 ) -> Any:
     last_error: UpstreamError | None = None
     tried = 0
@@ -320,12 +321,17 @@ async def post_chat_with_failover(
             continue
         tried += 1
         try:
-            raw = await client.post_chat(payload, credential=cred)
+            # Keep older test doubles / integrations compatible when no affinity
+            # value was supplied.
+            if session_id is None:
+                raw = await client.post_chat(payload, credential=cred)
+            else:
+                raw = await client.post_chat(payload, credential=cred, session_id=session_id)
             pool.clear_cooldown(account.id)
             return raw
         except UpstreamError as exc:
             last_error = exc
-            if is_failover_status(exc.status_code):
+            if is_failover_status(exc.status_code) and not _is_session_limit_error(exc):
                 pool.mark_cooldown(account.id, exc.status_code)
                 logger.info(
                     "chat failover from account=%s name=%s status=%s",
@@ -346,6 +352,7 @@ async def open_chat_stream_with_failover(
     resolver: CredentialResolver,
     pool: AccountPool,
     payload: dict[str, Any],
+    session_id: str | None = None,
 ):
     """Return (stream_cm, response) for the first account that accepts the stream."""
     last_error: UpstreamError | None = None
@@ -355,13 +362,16 @@ async def open_chat_stream_with_failover(
         except RuntimeError as exc:
             last_error = UpstreamError(str(exc), 503)
             continue
-        stream_cm = client.stream_chat(payload, credential=cred)
+        if session_id is None:
+            stream_cm = client.stream_chat(payload, credential=cred)
+        else:
+            stream_cm = client.stream_chat(payload, credential=cred, session_id=session_id)
         try:
             response = await stream_cm.__aenter__()
         except UpstreamError as exc:
             await _close_cm(stream_cm, exc)
             last_error = exc
-            if is_failover_status(exc.status_code):
+            if is_failover_status(exc.status_code) and not _is_session_limit_error(exc):
                 pool.mark_cooldown(account.id, exc.status_code)
                 logger.info(
                     "chat stream failover from account=%s name=%s status=%s",
@@ -374,29 +384,24 @@ async def open_chat_stream_with_failover(
         except Exception as exc:  # noqa: BLE001
             await _close_cm(stream_cm, exc)
             raise
-        if response.status_code >= 400:
-            raw = await response.aread()
+        if not 200 <= response.status_code < 300:
             try:
-                import json
-
-                parsed = json.loads(raw.decode("utf-8")) if raw else None
-            except ValueError:
-                parsed = raw.decode("utf-8", errors="replace") if raw else None
-            message = str(parsed) if not isinstance(parsed, dict) else (
-                parsed.get("message")
-                or (parsed.get("error") or {}).get("message")
-                or f"Upstream stream failed with HTTP {response.status_code}"
-            )
+                raw = await response.aread()
+                parsed = _parse_stream_error(raw, response.headers.get("content-type", ""))
+                message = _error_message(parsed, response.status_code)
+            except Exception:
+                await _close_cm(stream_cm)
+                raise
             await _close_cm(stream_cm)
-            err = UpstreamError(str(message), response.status_code, parsed)
+            err = UpstreamError(message, response.status_code, parsed)
             last_error = err
-            if is_failover_status(response.status_code):
+            if not _is_session_limit_error(err) and is_failover_status(err.status_code):
                 pool.mark_cooldown(account.id, response.status_code)
                 logger.info(
                     "chat stream failover from account=%s name=%s status=%s",
                     account.id,
                     account.name,
-                    response.status_code,
+                    err.status_code,
                 )
                 continue
             raise err
@@ -405,6 +410,38 @@ async def open_chat_stream_with_failover(
     if last_error is not None:
         raise last_error
     raise UpstreamError("No healthy accounts available in the pool", 503)
+
+
+def _parse_stream_error(raw: bytes, content_type: str) -> Any:
+    """Parse JSON or a compact SSE JSON error; never expose arbitrary response text."""
+    import json
+
+    if not raw:
+        return None
+    text = raw.decode("utf-8", errors="replace").strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    if "event-stream" in content_type.lower() or text.startswith(("data:", "event:")):
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data and data != "[DONE]":
+                try:
+                    value = json.loads(data)
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    return value
+    return None
+
+
+def _is_session_limit_error(error: UpstreamError) -> bool:
+    """Avoid moving a capped conversation onto an unrelated pooled account."""
+    message = str(error)
+    return "并发会话数" in message and "上限" in message
 
 
 async def list_models_with_failover(

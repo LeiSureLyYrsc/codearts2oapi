@@ -121,7 +121,7 @@ OpenCode 请使用 OpenAI 兼容供应商，将 `baseURL` 指向网关的 `/v1`�
 
 官方活动「每日签到得积分」面向已升级积分计费的个人版用户。本网关会先查套餐：`package.is_credit_package === true` 视为积分账号，否则返回 `ineligible`，不领取。
 
-流程为：查询套餐 → 从 `DESKTOP` 活动列表匹配 `DAILY_CLAIM` → 带活动 `campaignId` 和 `idempotentKey` 领取 → 若返回领取记录 ID（`data.id` 或 `data.userBenefitId`），用 `userBenefitId` 确认。已有配置中的 `USER_LOGIN` 会按 `DAILY_CLAIM` 处理；桌面端的 `USER_LOGIN` 活动与每日签到不同。已领取返回 `already_claimed`，不视为错误。
+流程为：查询套餐 → 从 `DESKTOP` 活动列表查找每日签到 → 带活动 `campaignId` 和 `idempotentKey` 领取 → 若返回领取记录 ID（`data.id` 或 `data.userBenefitId`），用 `userBenefitId` 确认。本网关优先匹配 `DAILY_CLAIM`；上游也可能将「每日签到领积分」下发为 `USER_LOGIN`，只在能唯一识别出该签到活动时才领取，不会把普通登录活动当成签到。旧配置 `USER_LOGIN` 与默认配置 `DAILY_CLAIM` 都使用这一规则。已领取返回 `already_claimed`，不视为错误。
 
 签到复用账号已有的 CLI OAuth 临时 AK/SK 和安全令牌（或该账号配置的 AK/SK），不读取桌面端凭据。如果额度和模型可查询，但活动请求仍被上游拒绝，请通过官方桌面端或[门户](https://codearts.huaweicloud.com/portal)的「活动福利 → 每日领取」手动签到。若其他请求也提示会话过期，先在账号池「重新授权」。
 

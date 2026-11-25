@@ -66,6 +66,31 @@ DAILY = {
     "claimable": True,
     "status": "CLAIMABLE",
 }
+# Live-inspired daily entry: the daily benefit is typed USER_LOGIN and is
+# identified by its title plus benefit/trigger fields.
+LIVE_DAILY = {
+    "campaignId": "camp-daily-live",
+    "type": "USER_LOGIN",
+    "title": "每日签到领100积分",
+    "benefitUnit": "CREDIT",
+    "benefitAmount": 100,
+    "claimable": True,
+    "status": "ELIGIBLE",
+    "extra": {"triggerEvent": "user.login", "triggerMode": "MANUAL_CLAIM"},
+}
+LIVE_LOGIN = {
+    "campaignId": "camp-plain-login",
+    "type": "USER_LOGIN",
+    "title": "登录领积分",
+    "benefitUnit": "CREDIT",
+    "claimable": True,
+    "status": "ELIGIBLE",
+    "extra": {"triggerEvent": "user.login", "triggerMode": "AUTO_GRANT"},
+}
+
+
+def delivery(*items: dict[str, Any]) -> dict[str, Any]:
+    return {"code": 0, "message": "success", "data": {"items": list(items)}}
 
 
 def test_credit_account_detection() -> None:
@@ -96,21 +121,51 @@ def test_select_campaigns_defaults_to_daily_claim() -> None:
     assert {c["campaignId"] for c in all_claimable} == {"camp-login", "login-event", "other"}
 
 
+def test_exact_daily_claim_beats_live_user_login_fallback() -> None:
+    campaigns = [LIVE_DAILY, DAILY]
+    assert select_campaigns(campaigns) == [DAILY]
+    assert select_campaigns(campaigns, campaign_type="USER_LOGIN") == [DAILY]
+    # Fallback only applies when no exact DAILY_CLAIM activity is present.
+    assert select_campaigns([LIVE_DAILY, LIVE_LOGIN], campaign_type="USER_LOGIN") == [LIVE_DAILY]
+    assert select_campaigns([LIVE_DAILY]) == [LIVE_DAILY]
+
+
+def test_unlabeled_or_duplicate_login_fallbacks_are_not_claimed() -> None:
+    # Plain login activity: no 「每日签到」 marker, so never claimed.
+    assert select_campaigns([LIVE_LOGIN], campaign_type="USER_LOGIN") == []
+    assert select_campaigns([LIVE_LOGIN]) == []
+    # Title marker alone without CREDIT / MANUAL_CLAIM evidence is not enough.
+    weak = {**LIVE_LOGIN, "title": "每日签到", "benefitUnit": "TOKEN"}
+    weak["extra"] = {"triggerEvent": "user.login"}
+    assert select_campaigns([weak], campaign_type="USER_LOGIN") == []
+    # Two distinct labeled candidates are ambiguous => claim nothing.
+    twin = {**LIVE_DAILY, "campaignId": "camp-daily-other"}
+    assert select_campaigns([LIVE_DAILY, twin], campaign_type="USER_LOGIN") == []
+    # Same id repeated is still a single candidate.
+    assert select_campaigns([LIVE_DAILY, {**LIVE_DAILY}], campaign_type="USER_LOGIN") == [LIVE_DAILY]
+    # Only usable IDs can back a fallback: empty string, bool, and structures are rejected.
+    for bad_id in ("", "  ", True, {"a": 1}):
+        assert select_campaigns([{**LIVE_DAILY, "campaignId": bad_id}], campaign_type="USER_LOGIN") == []
+    assert select_campaigns([{**LIVE_DAILY, "campaignId": 7}], campaign_type="USER_LOGIN") == [
+        {**LIVE_DAILY, "campaignId": 7}
+    ]
+
+
 @pytest.mark.parametrize(
-    ("delivery", "status", "expected_message"),
+    ("payload", "status", "expected_message"),
     [
         ({"code": 0, "data": {"items": []}}, "no_campaign", "empty activity list (looking for DAILY_CLAIM)"),
         (
             {"code": 0, "data": {"items": [{"campaignId": "not-for-output", "type": "USER_LOGIN"}]}},
             "no_campaign",
-            "No matching campaign for DAILY_CLAIM in 1 upstream activities; USER_LOGIN is a separate activity",
+            "No matching campaign for DAILY_CLAIM in 1 upstream activities",
         ),
         ({"code": 0, "data": {"items": {}}}, "error", "Unexpected activity response format"),
         ({"code": 0, "data": {"items": [None]}}, "error", "Unexpected activity response format"),
     ],
 )
-async def test_unmatched_delivery_is_diagnostic_without_claiming(delivery, status, expected_message):
-    transport = FakeTransport(plugin=CREDIT, activities=delivery)
+async def test_unmatched_delivery_is_diagnostic_without_claiming(payload, status, expected_message):
+    transport = FakeTransport(plugin=CREDIT, activities=payload)
     result = await run_checkin(transport, campaign_type="USER_LOGIN")
     assert result.status == status
     assert expected_message in result.message
@@ -234,6 +289,58 @@ async def test_claim_all_claimable_processes_multiple() -> None:
     result = await run_checkin(transport, all_claimable=True)
     assert result.status == "claimed"
     assert [cid for cid, _ch in transport.claim_calls] == ["camp-login", "bonus"]
+
+
+@pytest.mark.asyncio
+async def test_live_user_login_daily_claim_full_claim_and_confirm() -> None:
+    activities = delivery(
+        LIVE_DAILY,
+        {"campaignId": "student", "type": "STUDENT_CERTIFIED", "title": "学生认证"},
+        {"campaignId": "new-user", "type": "NEW_USER_REGISTER", "title": "新用户注册"},
+    )
+    transport = FakeTransport(
+        plugin=CREDIT,
+        activities=activities,
+        claim_result=({"code": 0, "message": "success", "data": {"id": "benefit-1"}}, 200),
+        confirm_result=({"code": 0, "message": "success", "data": None}, 200),
+    )
+    result = await run_checkin(transport)
+    assert result.status == "claimed"
+    assert transport.claim_calls == [("camp-daily-live", "DESKTOP")]
+    assert transport.confirm_calls == ["benefit-1"]
+    assert result.actions[0].campaign_type == "USER_LOGIN"
+    assert result.actions[0].confirmed is True
+
+
+@pytest.mark.asyncio
+async def test_live_daily_already_claimed_does_not_write() -> None:
+    claimed = {**LIVE_DAILY, "claimable": False, "status": "CLAIMED"}
+    transport = FakeTransport(plugin=CREDIT, activities=delivery(claimed))
+    result = await run_checkin(transport)
+    assert result.status == "already_claimed"
+    assert result.actions[0].status == "already_claimed"
+    assert transport.claim_calls == transport.confirm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_live_plain_login_without_marker_is_not_claimed() -> None:
+    transport = FakeTransport(
+        plugin=CREDIT,
+        activities=delivery(LIVE_LOGIN, {"campaignId": "new-user", "type": "NEW_USER_REGISTER"}),
+    )
+    result = await run_checkin(transport)
+    assert result.status == "no_campaign"
+    assert "DAILY_CLAIM" in result.message
+    assert result.actions == transport.claim_calls == transport.confirm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_live_ambiguous_daily_fallbacks_are_not_claimed() -> None:
+    twin = {**LIVE_DAILY, "campaignId": "camp-daily-twin"}
+    transport = FakeTransport(plugin=CREDIT, activities=delivery(LIVE_DAILY, twin))
+    result = await run_checkin(transport)
+    assert result.status == "no_campaign"
+    assert result.actions == transport.claim_calls == transport.confirm_calls == []
 
 
 def test_interpret_claim_id_in_wrapper() -> None:

@@ -1,8 +1,13 @@
-"""Official daily check-in (DAILY_CLAIM) state machine and orchestrator.
+"""Official daily check-in state machine and orchestrator.
 
-Official activity 「每日签到得积分」 uses campaign type DAILY_CLAIM and is
-reported as running 2026-10-27 20:00 through 2026-12-31 23:59:59
-Asia/Shanghai. Amounts depend on the plan (experience 100, standard 150,
+The live desktop delivery reports the daily check-in as an activity typed
+``USER_LOGIN`` whose title starts with 「每日签到」 (benefitUnit CREDIT,
+``extra.triggerMode`` MANUAL_CLAIM). Exact ``DAILY_CLAIM`` campaigns are still
+supported and take precedence; only a single USER_LOGIN activity carrying
+those explicit daily markers is used as a fallback. Plain login activities are
+never claimed, and several distinct fallback candidates claim nothing.
+
+Amounts depend on the plan (experience 100, standard 150,
 premium/flagship 200) and are valid for that day only.
 
 The public API catalog does not document these endpoints. They go through
@@ -36,6 +41,9 @@ from codearts2api.client import CHECKIN_CHANNEL, UpstreamError
 logger = logging.getLogger(__name__)
 
 DAILY_CAMPAIGN_TYPE = "DAILY_CLAIM"
+# Live desktop delivery brands the daily activity 「每日签到领100积分」 while
+# typing it USER_LOGIN; only that title prefix is treated as a daily marker.
+DAILY_TITLE_PREFIX = "每日签到"
 ALREADY_CLAIMED_CODES = frozenset({"40001", "E40001"})
 ACTIVITY_MISSING_CODES = frozenset({"40401", "E40401"})
 
@@ -221,8 +229,31 @@ def is_claimable(campaign: dict[str, Any]) -> bool:
 
 def effective_campaign_type(configured_type: str) -> str:
     normalized = configured_type.strip().upper()
-    # USER_LOGIN was the old default but is a different desktop activity.
+    # Configs that still name USER_LOGIN keep resolving to the exact daily
+    # campaign type; the USER_LOGIN fallback lives in select_campaigns.
     return DAILY_CAMPAIGN_TYPE if normalized == "USER_LOGIN" else normalized
+
+
+def is_explicit_daily_checkin(campaign: dict[str, Any]) -> bool:
+    """True only when the live desktop fields brand a USER_LOGIN as the daily claim."""
+    if (campaign_type_of(campaign) or "").strip().upper() != "USER_LOGIN":
+        return False
+    if not (campaign_name_of(campaign) or "").startswith(DAILY_TITLE_PREFIX):
+        return False
+    if str(campaign.get("benefitUnit") or "").strip().upper() != "CREDIT":
+        return False
+    extra = campaign.get("extra")
+    trigger_mode = extra.get("triggerMode") if isinstance(extra, dict) else None
+    return str(trigger_mode or "").strip().upper() == "MANUAL_CLAIM"
+
+
+def _fallback_id(cid: Any) -> str | None:
+    """Usable dedupe key for the login fallback: non-empty string or positive int."""
+    if type(cid) is int and cid > 0:
+        return str(cid)
+    if isinstance(cid, str) and cid.strip():
+        return cid.strip()
+    return None
 
 
 def select_campaigns(
@@ -232,6 +263,9 @@ def select_campaigns(
     all_claimable: bool = False,
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
+    # Live payloads type the daily check-in as USER_LOGIN. Keep such activities
+    # aside so an exact DAILY_CLAIM always wins; only a single fallback is used.
+    fallback: dict[str, dict[str, Any]] = {}
     seen: set[str] = set()
     requested_type = effective_campaign_type(campaign_type)
     for campaign in campaigns:
@@ -245,10 +279,19 @@ def select_campaigns(
                 continue
         else:
             if not typ or typ.strip().upper() != requested_type:
+                if requested_type == DAILY_CAMPAIGN_TYPE and is_explicit_daily_checkin(campaign):
+                    fid = _fallback_id(cid)
+                    if fid is not None:
+                        fallback.setdefault(fid, campaign)
                 continue
         seen.add(key)
         selected.append(campaign)
-    return selected
+    if selected or all_claimable:
+        return selected
+    if len(fallback) == 1:
+        return list(fallback.values())
+    # No exact match and no unique daily fallback: claim nothing.
+    return []
 
 
 def extract_business_code(payload: Any) -> str | None:
@@ -437,10 +480,6 @@ async def run_checkin(
             message = f"Upstream returned an empty activity list (looking for {target})"
         else:
             message = f"No matching campaign for {target} in {len(activities)} upstream activities"
-            if not all_claimable and target == DAILY_CAMPAIGN_TYPE and any(
-                (campaign_type_of(activity) or "").strip().upper() == "USER_LOGIN" for activity in activities
-            ):
-                message += "; USER_LOGIN is a separate activity"
         return CheckinResult(
             status="no_campaign",
             account_type=label,

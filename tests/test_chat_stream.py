@@ -127,6 +127,106 @@ def test_opencode_tool_call_round_trip_uses_same_signed_session(settings):
         client.__exit__(None, None, None)
 
 
+def test_opencode_deepseek_flash_token_clamp_reaches_upstream(settings):
+    bodies = []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        chunk = {"choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}]}
+        return httpx.Response(
+            200,
+            text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    client = _client(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        payload = {
+            "model": "codearts/deepseek-v4.1-flash-1017",
+            "stream": True,
+            "max_completion_tokens": 256000,
+            "stream_options": {"include_usage": True},
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        rsp = client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer test-local-key"},
+            json=payload,
+        )
+        assert rsp.status_code == 200, rsp.text
+        assert len(bodies) == 1
+        body = bodies[0]
+        assert body["model"] == "deepseek-v4.1-flash-1017"
+        assert body["max_tokens"] == 65536
+        assert "max_completion_tokens" not in body
+        assert body["stream_options"] == {"include_usage": True}
+        assert body["stream"] is True and body["tool_stream"] is True
+        assert [tool["function"]["name"] for tool in body["tools"]] == ["lookup"]
+    finally:
+        client.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_custom_tool_round_trip_without_client_specific_config(settings, stream):
+    raw_input = '两行\n"quoted" \\ text'
+    arguments = json.dumps({"input": raw_input}, ensure_ascii=False, separators=(",", ":"))
+    requests = []
+
+    async def handler(request):
+        body = json.loads(request.content)
+        requests.append(body)
+        tool = body["tools"][0]
+        assert tool["type"] == "function" and "custom" not in tool
+        name = tool["function"]["name"]
+        assert body["tool_choice"] == {"type": "function", "function": {"name": name}}
+        if len(requests) == 2:
+            assistant, result = body["messages"][-2:]
+            assert assistant["tool_calls"][0] == {
+                "id": "call_custom", "type": "function", "function": {"name": name, "arguments": arguments},
+            }
+            assert result["tool_call_id"] == "call_custom"
+        call = {"id": "call_custom", "type": "function", "function": {"name": name, "arguments": arguments}}
+        if not body["stream"]:
+            return httpx.Response(200, json={"choices": [{
+                "message": {"role": "assistant", "tool_calls": [call]}, "finish_reason": "tool_calls",
+            }]})
+        start = {**call, "index": 0, "function": {"name": name, "arguments": arguments[:10]}}
+        tail = {"function": {"arguments": arguments[10:]}}
+        chunks = [{"choices": [{"index": 0, "delta": {"tool_calls": [item]}}]} for item in (start, tail)]
+        data = "".join(f"data: {json.dumps(item)}\n\n" for item in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, text=data, headers={"Content-Type": "text/event-stream"})
+
+    client = _client(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        headers = {"Authorization": "Bearer test-local-key", "User-Agent": "another-chat-client"}
+        payload = {
+            "model": "M", "stream": stream, "messages": [{"role": "user", "content": "use the tool"}],
+            "tools": [{"type": "custom", "custom": {"name": "edit_text", "format": {"type": "text"}}}],
+            "tool_choice": {"type": "custom", "custom": {"name": "edit_text"}},
+        }
+        result = client.post("/v1/chat/completions", headers=headers, json=payload)
+        assert result.status_code == 200, result.text
+        if stream:
+            choices = [item for line in result.text.splitlines() if line.startswith("data: {") for item in json.loads(line[6:])["choices"]]
+            [call] = [item for choice in choices for item in choice["delta"].get("tool_calls", [])]
+            assert choices[-1]["finish_reason"] == "tool_calls" and result.text.rstrip().endswith("data: [DONE]")
+            assert call.pop("index") == 0
+        else:
+            [call] = result.json()["choices"][0]["message"]["tool_calls"]
+        assert call == {"type": "custom", "id": "call_custom", "custom": {"name": "edit_text", "input": raw_input}}
+        payload["messages"].extend([
+            {"role": "assistant", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": call["id"], "content": "done"},
+        ])
+        followup = client.post("/v1/chat/completions", headers=headers, json=payload)
+        assert followup.status_code == 200, followup.text
+        assert len(requests) == 2
+    finally:
+        client.__exit__(None, None, None)
+
+
 def test_done_emits_missing_stop_or_tool_finish(settings: Settings) -> None:
     body = (
         'data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n'

@@ -49,6 +49,42 @@ def test_config_created_without_credentials_and_recreated(tmp_path):
     assert again.get(account.id).sk == "sk"
 
 
+def test_chat_concurrency_limits_persist_and_default_for_legacy_accounts(tmp_path):
+    pool = pool_for(tmp_path)
+    account = pool.add_account(
+        name="limited", kind="aksk", ak="ak", sk="sk", chat_concurrency_limit=3
+    )
+    assert account.chat_concurrency_limit == 3
+    assert pool.export_account(account.id)["account"]["chat_concurrency_limit"] == 3
+    pool.update_account(account.id, {"chat_concurrency_limit": 0})
+    pool.update_runtime_settings({"chat_concurrency_limit": 5})
+
+    legacy = auth_payload("legacy", "legacy")
+    other = pool_for(tmp_path / "other")
+    imported = other.import_accounts([legacy])[0]
+    assert imported.chat_concurrency_limit == 0
+    assert other.export_account("legacy")["account"]["chat_concurrency_limit"] == 0
+
+    reloaded = pool_for(tmp_path)
+    assert reloaded.get(account.id).chat_concurrency_limit == 0
+    assert reloaded.settings.chat_concurrency_limit == 5
+    assert json.loads(reloaded.path.read_text())["settings"]["chat_concurrency_limit"] == 5
+
+
+def test_chat_concurrency_limit_rejects_negative_values(tmp_path):
+    pool = pool_for(tmp_path)
+    for invalid in (-1, -0.1, True, {}):
+        with pytest.raises(ValueError, match="chat_concurrency_limit"):
+            pool.update_runtime_settings({"chat_concurrency_limit": invalid})
+        with pytest.raises(ValueError, match="chat_concurrency_limit"):
+            pool.add_account(name="negative", kind="aksk", ak="ak", sk="sk",
+                             chat_concurrency_limit=invalid)
+    account = pool.add_account(name="valid", kind="aksk", ak="ak", sk="sk")
+    for invalid in (-1, -0.1, True, {}):
+        with pytest.raises(ValueError, match="chat_concurrency_limit"):
+            pool.update_account(account.id, {"chat_concurrency_limit": invalid})
+
+
 def test_account_crud_stays_out_of_runtime_config(tmp_path):
     pool = pool_for(tmp_path)
     account = pool.add_account(name="one", kind="aksk", ak="test-ak", sk="secret-value")

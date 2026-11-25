@@ -67,6 +67,7 @@ class Account:
     sk: str | None = None
     security_token: str | None = None
     project_id: str | None = None
+    chat_concurrency_limit: int = 0
     session_file: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
@@ -90,6 +91,7 @@ class Account:
             "sk": self.sk,
             "security_token": self.security_token,
             "project_id": self.project_id,
+            "chat_concurrency_limit": self.chat_concurrency_limit,
             "session_file": self.session_file,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -115,6 +117,7 @@ class Account:
             sk=payload.get("sk") or None,
             security_token=payload.get("security_token") or None,
             project_id=payload.get("project_id") or None,
+            chat_concurrency_limit=payload.get("chat_concurrency_limit", 0),
             session_file=payload.get("session_file") or None,
             created_at=payload.get("created_at"),
             updated_at=payload.get("updated_at"),
@@ -462,6 +465,7 @@ class AccountPool:
         session: OAuthSession,
         enabled: bool = True,
         note: str = "",
+        chat_concurrency_limit: int = 0,
     ) -> Account:
         """Create an OAuth account and its first session in one atomic write.
 
@@ -473,6 +477,8 @@ class AccountPool:
             raise ValueError("请填写账号名称")
         if not session.access_key_id or not session.secret_access_key:
             raise ValueError("OAuth session is missing credentials")
+        if type(chat_concurrency_limit) is not int or chat_concurrency_limit < 0:
+            raise ValueError("chat_concurrency_limit must be >= 0")
         with self._lock:
             if self.find_by_name(name) is not None:
                 raise ValueError(f"已存在同名账号「{name}」，请换一个名称，或先删除旧账号。")
@@ -484,6 +490,7 @@ class AccountPool:
                 kind="oauth",
                 enabled=bool(enabled),
                 note=note or "",
+                chat_concurrency_limit=chat_concurrency_limit,
                 session_file=f"{account_id}.json",
                 created_at=now,
                 updated_at=now,
@@ -509,10 +516,13 @@ class AccountPool:
         sk: str | None = None,
         security_token: str | None = None,
         project_id: str | None = None,
+        chat_concurrency_limit: int = 0,
     ) -> Account:
         kind = kind.strip().lower()
         if kind not in ACCOUNT_KINDS:
             raise ValueError("kind must be aksk or oauth")
+        if type(chat_concurrency_limit) is not int or chat_concurrency_limit < 0:
+            raise ValueError("chat_concurrency_limit must be >= 0")
         name = name.strip()
         if not name:
             raise ValueError("name is required")
@@ -531,6 +541,7 @@ class AccountPool:
                 sk=sk or None,
                 security_token=security_token or None,
                 project_id=project_id or None,
+                chat_concurrency_limit=chat_concurrency_limit,
                 session_file=f"{account_id}.json" if kind == "oauth" else None,
                 created_at=now,
                 updated_at=now,
@@ -557,6 +568,11 @@ class AccountPool:
             if "project_id" in data:
                 value = data["project_id"]
                 account.project_id = None if value in (None, "") else str(value)
+            if "chat_concurrency_limit" in data and data["chat_concurrency_limit"] is not None:
+                limit = data["chat_concurrency_limit"]
+                if type(limit) is not int or limit < 0:
+                    raise ValueError("chat_concurrency_limit must be >= 0")
+                account.chat_concurrency_limit = limit
             # Blank secret fields mean keep the existing value.
             if "ak" in data and data["ak"]:
                 account.ak = str(data["ak"])
@@ -738,6 +754,7 @@ class AccountPool:
             "has_sk": bool(account.sk),
             "has_security_token": bool(account.security_token),
             "project_id": account.project_id,
+            "chat_concurrency_limit": account.chat_concurrency_limit,
             "session_file": account.session_file if account.kind == "oauth" else None,
             "oauth": oauth_view,
             "last_checkin": account.last_checkin,
@@ -856,6 +873,12 @@ def validate_settings_update(updates: dict[str, Any]) -> dict[str, Any]:
         if seconds < 0:
             raise ValueError("cooldown_seconds must be >= 0")
         cleaned["cooldown_seconds"] = seconds
+
+    if "chat_concurrency_limit" in cleaned and cleaned["chat_concurrency_limit"] is not None:
+        limit = cleaned["chat_concurrency_limit"]
+        if type(limit) is not int or limit < 0:
+            raise ValueError("chat_concurrency_limit must be >= 0")
+        cleaned["chat_concurrency_limit"] = limit
 
     if "model_cache_ttl" in cleaned and cleaned["model_cache_ttl"] is not None:
         ttl = int(cleaned["model_cache_ttl"])

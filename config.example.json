@@ -21,7 +21,8 @@
     "oauth_locale": "zh-cn",
     "oauth_callback_port": 0,
     "pool_strategy": "round_robin",
-    "cooldown_seconds": 60
+    "cooldown_seconds": 60,
+    "chat_concurrency_limit": 0
   },
   "pool": {
     "rr_index": 0

@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
 from codearts2api.oauth.session import OAuthSession, SessionStore
 
@@ -25,6 +25,7 @@ class AuthAccount(BaseModel):
     sk: StrictStr | None = None
     security_token: StrictStr | None = None
     project_id: StrictStr | None = None
+    chat_concurrency_limit: StrictInt = Field(default=0, ge=0)
     session_file: StrictStr | None = None
     created_at: StrictStr | None = None
     updated_at: StrictStr | None = None

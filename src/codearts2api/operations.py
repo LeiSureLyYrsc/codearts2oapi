@@ -6,6 +6,8 @@ import logging
 import math
 from typing import Any, TYPE_CHECKING
 
+import anyio
+
 from codearts2api.checkin import (
     CheckinResult,
     account_type_label,
@@ -19,7 +21,7 @@ from codearts2api.credentials import CredentialResolver, ResolvedCredential
 from codearts2api.pool import Account, AccountPool, is_failover_status, now_in_timezone
 
 if TYPE_CHECKING:
-    pass
+    from codearts2api.chat_concurrency import ChatRequestTicket
 
 logger = logging.getLogger(__name__)
 
@@ -310,16 +312,21 @@ async def post_chat_with_failover(
     pool: AccountPool,
     payload: dict[str, Any],
     session_id: str | None = None,
+    ticket: ChatRequestTicket | None = None,
 ) -> Any:
     last_error: UpstreamError | None = None
-    tried = 0
+    busy = False
     for account in pool.iter_candidates():
+        if ticket is not None and not ticket.bind(account.id, account.chat_concurrency_limit):
+            busy = True
+            continue
         try:
             cred = resolver.resolve_account(account)
         except RuntimeError as exc:
+            if ticket is not None:
+                ticket.unbind()
             last_error = UpstreamError(str(exc), 503)
             continue
-        tried += 1
         try:
             # Keep older test doubles / integrations compatible when no affinity
             # value was supplied.
@@ -339,10 +346,14 @@ async def post_chat_with_failover(
                     account.name,
                     exc.status_code,
                 )
+                if ticket is not None:
+                    ticket.unbind()
                 continue
             raise
     if last_error is not None:
         raise last_error
+    if busy:
+        raise UpstreamError("Eligible accounts have reached their chat request concurrency limit", 429)
     raise UpstreamError("No healthy accounts available in the pool", 503)
 
 
@@ -353,13 +364,20 @@ async def open_chat_stream_with_failover(
     pool: AccountPool,
     payload: dict[str, Any],
     session_id: str | None = None,
+    ticket: ChatRequestTicket | None = None,
 ):
     """Return (stream_cm, response) for the first account that accepts the stream."""
     last_error: UpstreamError | None = None
+    busy = False
     for account in pool.iter_candidates():
+        if ticket is not None and not ticket.bind(account.id, account.chat_concurrency_limit):
+            busy = True
+            continue
         try:
             cred = resolver.resolve_account(account)
         except RuntimeError as exc:
+            if ticket is not None:
+                ticket.unbind()
             last_error = UpstreamError(str(exc), 503)
             continue
         if session_id is None:
@@ -379,6 +397,8 @@ async def open_chat_stream_with_failover(
                     account.name,
                     exc.status_code,
                 )
+                if ticket is not None:
+                    ticket.unbind()
                 continue
             raise
         except Exception as exc:  # noqa: BLE001
@@ -389,10 +409,8 @@ async def open_chat_stream_with_failover(
                 raw = await response.aread()
                 parsed = _parse_stream_error(raw, response.headers.get("content-type", ""))
                 message = _error_message(parsed, response.status_code)
-            except Exception:
+            finally:
                 await _close_cm(stream_cm)
-                raise
-            await _close_cm(stream_cm)
             err = UpstreamError(message, response.status_code, parsed)
             last_error = err
             if not _is_session_limit_error(err) and is_failover_status(err.status_code):
@@ -403,12 +421,16 @@ async def open_chat_stream_with_failover(
                     account.name,
                     err.status_code,
                 )
+                if ticket is not None:
+                    ticket.unbind()
                 continue
             raise err
         pool.clear_cooldown(account.id)
         return stream_cm, response
     if last_error is not None:
         raise last_error
+    if busy:
+        raise UpstreamError("Eligible accounts have reached their chat request concurrency limit", 429)
     raise UpstreamError("No healthy accounts available in the pool", 503)
 
 
@@ -480,9 +502,10 @@ async def list_models_with_failover(
 
 async def _close_cm(stream_cm: Any, exc: BaseException | None = None) -> None:
     try:
-        if exc is None:
-            await stream_cm.__aexit__(None, None, None)
-        else:
-            await stream_cm.__aexit__(type(exc), exc, exc.__traceback__)
+        with anyio.CancelScope(shield=True):
+            if exc is None:
+                await stream_cm.__aexit__(None, None, None)
+            else:
+                await stream_cm.__aexit__(type(exc), exc, exc.__traceback__)
     except Exception:  # noqa: BLE001
         logger.debug("Failed to close upstream stream after failover", exc_info=True)

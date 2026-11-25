@@ -105,7 +105,17 @@ https://snap-access.cn-north-4.myhuaweicloud.com
 
 `GET /v1/models` 从上游 `GET /v1/model/builtin` 动态拉取，默认缓存 60 秒，`?refresh=true` 可强制刷新。只对外暴露 `enable=true` 的模型；若存在 `display_enabled` 字段，也必须为 true。对话请求使用裸模型 id（例如 `GLM-5.2`）；若客户端传来 `codearts/` 前缀，会去掉后再转给上游。
 
-OpenCode 请使用 OpenAI 兼容供应商，将 `baseURL` 指向网关的 `/v1`，并为确实支持工具调用的模型启用 tools。网关会按模型转换 token 上限字段，并复用 OpenCode 提供的会话标识。若上游明确报「并发会话数已达上限」，请停止不用的会话后重试；网关不会换账号绕过此限制。
+OpenCode 请使用 OpenAI 兼容供应商，将 `baseURL` 指向网关的 `/v1`，并为确实支持工具调用的模型启用 tools。`limit.context` 是上下文容量，`limit.output` 是单次输出上限。CodeArts 上的 `deepseek-v4.1-flash` 和 `deepseek-v4.1-flash-1017` 应设置为 `context: 1048576`、`output: 65536`；配置更大的输出值可能收到上游 `InferHub.001001005.400`。网关会按模型转换 token 字段，并将这两个模型的超限输出请求截到 65,536，不会调高较小的请求值。
+
+网关会复用 OpenCode 提供的会话标识。若上游明确报「并发会话数已达上限」，请停止不用的会话后重试；网关不会换账号绕过此限制。
+
+网关会把 OpenAI Chat Completions 的自由格式工具转换为 CodeArts 的函数工具，并在流式与非流式响应中还原调用 ID、名称和文本输入。适配不依赖客户端名称，OpenCode 和其他发送同样格式的工具无需额外开关；普通函数工具不受此转换影响。语法约束随工具说明转发，不保证上游能像原生自由格式接口一样强制执行语法。上游 HTTP 400 仍会传回错误码，不会在网关自动重试。
+
+#### 对话并发与释放请求
+
+在 WebUI「运行配置」设置全局对话并发上限，在「账号池 → 设置并发」设置单账号上限。全局限制按所有账号合计，不是每个账号各有一份。例如全局为 `3` 时，两个账号正在各处理 `2` 和 `1` 个对话，新的请求就会返回 HTTP 429。`0` 表示该层不额外限流。限制只计本进程正在处理的 `/v1/chat/completions`（包括流式连接），不计签到或模型查询，也不会改变 CodeArts 服务端的会话额度。多个进程或实例分别计数。
+
+账号池的「释放请求」会取消该账号正在处理的对话并关闭上游连接，清理完成后返还并发名额；不会删除聊天历史或关闭官方客户端会话。管理 API 为 `POST /admin/accounts/{id}/release-requests`，返回请求取消的数量 `cancelled`。
 
 ### 5. 每日签到
 

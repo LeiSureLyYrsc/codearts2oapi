@@ -18,6 +18,7 @@
       </div>
       <div id="header-actions" class="header-actions hidden">
         <span id="header-status" class="pill">未连接</span>
+        <span id="global-concurrency-status" class="muted" aria-live="polite" aria-atomic="true">全站活动请求 — / 上限 —</span>
         <button type="button" id="btn-logout" class="btn ghost">退出登录</button>
       </div>
     </header>
@@ -50,6 +51,7 @@
               <p class="muted">对话按策略轮换 / 故障转移；每日签到会对每个已启用账号分别执行。</p>
             </div>
             <div class="actions">
+              <button type="button" class="btn" id="btn-refresh-accounts">刷新状态</button>
               <button type="button" class="btn primary" id="btn-add-oauth">连接 OAuth 账号</button>
               <button type="button" class="btn" id="btn-add-aksk">添加 AK/SK 账号</button>
               <button type="button" class="btn" id="btn-import-auth">导入 Auth 文件</button>
@@ -66,12 +68,13 @@
                   <th>启用</th>
                   <th>上次签到</th>
                   <th>状态</th>
+                  <th>对话并发</th>
                   <th>额度</th>
                   <th>操作</th>
                 </tr>
               </thead>
               <tbody id="account-rows">
-                <tr><td colspan="8" class="muted">加载中…</td></tr>
+                <tr><td colspan="9" class="muted">加载中…</td></tr>
               </tbody>
             </table>
           </div>
@@ -114,6 +117,7 @@
               <label>签到 Cron <input name="checkin_cron" required></label>
               <label>活动类型 <input name="campaign_type"></label>
               <label>模型缓存 TTL（秒） <input name="model_cache_ttl" type="number" min="0"></label>
+              <label>全站同时处理的对话请求上限（所有账号合计；0=不限） <input name="chat_concurrency_limit" type="number" min="0" step="1" value="0" required></label>
               <label>账号池策略
                 <select name="pool_strategy">
                   <option value="round_robin">round_robin（轮询）</option>
@@ -168,6 +172,7 @@
       <input type="hidden" name="kind" value="aksk">
       <label>名称 <input name="name" required></label>
       <label>备注 <input name="note"></label>
+      <label>账号对话并发上限（0=不限，仅此账号） <input name="chat_concurrency_limit" type="number" min="0" step="1" value="0" required></label>
       <div id="aksk-fields">
         <label>Access Key <input name="ak" autocomplete="off"></label>
         <label>Secret Key <input name="sk" type="password" autocomplete="new-password"></label>
@@ -198,6 +203,7 @@
         <form id="login-start-form">
           <label>账号名称 <input name="name" required maxlength="80" placeholder="例如：上班 / 个人" autocomplete="off"></label>
           <label>备注（可选） <input name="note" maxlength="200" autocomplete="off"></label>
+          <label>账号对话并发上限（0=不限，仅此账号） <input name="chat_concurrency_limit" type="number" min="0" step="1" value="0" required></label>
           <label class="check"><input name="enabled" type="checkbox" checked> 授权成功后立即启用</label>
           <p id="login-start-error" class="error hidden"></p>
           <div class="actions">

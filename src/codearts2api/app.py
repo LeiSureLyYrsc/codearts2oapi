@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -29,7 +30,9 @@ from codearts2api.chat import (
     normalize_completion,
     openai_error,
 )
-from codearts2api.chat_request import prepare_chat_payload
+from codearts2api.chat_concurrency import ChatConcurrency, ChatConcurrencyMiddleware
+from codearts2api.chat_request import ChatPayloadError, custom_tool_aliases, prepare_chat_payload
+from codearts2api.chat_tool_response import CustomToolStream, restore_completion_tools
 from codearts2api.client import SnapAccessClient, UpstreamError, chat_error_status, upstream_error_code
 from codearts2api.config import Settings
 from codearts2api.credentials import CredentialResolver
@@ -132,6 +135,7 @@ class LoginAttempt:
     server: CallbackServer
     authorize_url: str
     created_at: float
+    chat_concurrency_limit: int = 0
     message: str | None = None
     timer: Any = None
 
@@ -156,6 +160,7 @@ class AppState:
         self.resolver = CredentialResolver(settings, store=pool.session_store, pool=pool)
         self.scheduler: CheckinScheduler | None = None
         self.model_cache = ModelCache(settings.model_cache_ttl)
+        self.chat_concurrency = ChatConcurrency()
         self.last_checkin: dict[str, Any] | None = None
         self.last_checkin_at: str | None = None
         self.last_checkin_accounts: list[dict[str, Any]] | None = None
@@ -167,6 +172,12 @@ class AppState:
         if self.client is None:
             raise HTTPException(status_code=503, detail="HTTP client is not ready")
         return self.client
+
+    def public_account(self, account: Any) -> dict[str, Any]:
+        return {
+            **self.pool.public_account(account),
+            "active_chat_requests": self.chat_concurrency.active_count(account.id),
+        }
 
 
 def _state(request: Request) -> AppState:
@@ -404,12 +415,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         current_settings: Settings = Depends(get_settings),
     ):
         runtime = _state(request)
+        ticket = request.state.chat_request
+        if not ticket.admit(runtime.settings.chat_concurrency_limit):
+            return JSONResponse(status_code=429, content=openai_error("Gateway chat request concurrency limit reached", 429))
         if not runtime.resolver.has_any():
             require_upstream_credentials(current_settings)
         model = strip_codearts_prefix(body.model)
         upstream_payload = body.model_dump(exclude_none=True)
         upstream_payload["model"] = model
-        upstream_payload = prepare_chat_payload(upstream_payload)
+        try:
+            aliases = custom_tool_aliases(upstream_payload)
+            upstream_payload = prepare_chat_payload(upstream_payload, aliases=aliases)
+        except ChatPayloadError as exc:
+            return JSONResponse(status_code=400, content=openai_error(str(exc), 400, code="invalid_tool_request"))
         session_id = _chat_session_id(request)
 
         if body.stream:
@@ -420,6 +438,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     pool=runtime.pool,
                     payload=upstream_payload,
                     session_id=session_id,
+                    ticket=ticket,
                 )
             except UpstreamError as exc:
                 status = exc.status_code if 400 <= exc.status_code < 600 else 502
@@ -436,7 +455,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if media_type in ("application/json", "text/html") or media_type.endswith("+json"):
                 try:
                     raw = bytearray()
-                    if "json" in content_type:
+                    if media_type != "text/html":
                         async for chunk in response.aiter_bytes(chunk_size=8192):
                             if len(raw) + len(chunk) > 64 * 1024:
                                 raw.clear()
@@ -484,7 +503,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await events.aclose()
                     await _close_chat_response(stream_cm)
             return StreamingResponse(
-                _stream_chat(stream_cm, events, first, model),
+                _stream_chat(stream_cm, events, first, model, aliases),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -500,6 +519,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 pool=runtime.pool,
                 payload=upstream_payload,
                 session_id=session_id,
+                ticket=ticket,
             )
         except UpstreamError as exc:
             return JSONResponse(
@@ -511,7 +531,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse(status_code=status, content=openai_error(
                 _safe_upstream_error(raw) or "Upstream returned a chat error", status, code=upstream_error_code(raw),
             ))
-        return normalize_completion(raw, model)
+        completion = normalize_completion(raw, model)
+        if not aliases:
+            return completion
+        try:
+            return restore_completion_tools(completion, aliases)
+        except ValueError:
+            return JSONResponse(status_code=502, content=openai_error("Invalid upstream tool response", 502))
 
     @protected.post("/admin/checkin")
     async def post_checkin(
@@ -666,6 +692,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             session=session,
             enabled=attempt.enabled,
             note=attempt.note,
+            chat_concurrency_limit=attempt.chat_concurrency_limit,
         )
         return account.id
 
@@ -743,6 +770,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         legacy: bool,
         callback_port: int,
         resume_active: bool,
+        chat_concurrency_limit: int = 0,
     ) -> dict[str, Any]:
         _prune_logins(runtime)
         active = runtime.login_active
@@ -828,6 +856,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             server=server,
             authorize_url=authorize_url,
             created_at=time.monotonic(),
+            chat_concurrency_limit=chat_concurrency_limit,
         )
         runtime.login_active = attempt
         _schedule_expiry(runtime, attempt)
@@ -847,6 +876,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             name=body.name,
             note=body.note,
             enabled=body.enabled,
+            chat_concurrency_limit=body.chat_concurrency_limit,
             legacy=False,
             callback_port=current_settings.oauth_callback_port,
             resume_active=False,
@@ -1083,7 +1113,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @protected.get("/admin/accounts")
     async def get_admin_accounts(request: Request) -> dict[str, Any]:
         runtime = _state(request)
-        return {"accounts": runtime.pool.public_accounts()}
+        accounts = runtime.pool.public_accounts()
+        for account in accounts:
+            account["active_chat_requests"] = runtime.chat_concurrency.active_count(account["id"])
+        return {
+            "accounts": accounts,
+            "chat_concurrency_limit": runtime.settings.chat_concurrency_limit,
+            "active_chat_requests": runtime.chat_concurrency.active_count(),
+        }
 
     @protected.post("/admin/accounts")
     async def post_admin_accounts(body: AccountCreateRequest, request: Request) -> dict[str, Any]:
@@ -1110,11 +1147,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 sk=body.sk,
                 security_token=body.security_token,
                 project_id=body.project_id,
+                chat_concurrency_limit=body.chat_concurrency_limit,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         refresh_logging(runtime.settings, runtime.pool)
-        return runtime.pool.public_account(account)
+        return runtime.public_account(account)
 
     @protected.post("/admin/accounts/import")
     async def import_admin_accounts(request: Request) -> dict[str, Any]:
@@ -1136,7 +1174,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             detail = "Invalid auth JSON" if isinstance(exc, (json.JSONDecodeError, UnicodeError)) else str(exc)
             raise HTTPException(status_code=400, detail=detail) from None
         refresh_logging(runtime.settings, runtime.pool)
-        return {"accounts": [runtime.pool.public_account(a) for a in accounts]}
+        return {"accounts": [runtime.public_account(a) for a in accounts]}
 
     @protected.get("/admin/accounts/{account_id}/export")
     async def export_admin_account(account_id: str, request: Request) -> JSONResponse:
@@ -1163,7 +1201,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         refresh_logging(runtime.settings, runtime.pool)
-        return runtime.pool.public_account(account)
+        return runtime.public_account(account)
 
     @protected.delete("/admin/accounts/{account_id}")
     async def delete_admin_account(account_id: str, request: Request) -> dict[str, Any]:
@@ -1186,6 +1224,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         result = await probe_account(runtime.snap(), cred)
         return {"account_id": account_id, "name": account.name, **result}
+
+    @protected.post("/admin/accounts/{account_id}/release-requests")
+    async def release_admin_account_requests(account_id: str, request: Request) -> dict[str, Any]:
+        runtime = _state(request)
+        if runtime.pool.get(account_id) is None:
+            raise HTTPException(status_code=404, detail="Account not found")
+        return {"account_id": account_id, "cancelled": runtime.chat_concurrency.cancel_account(account_id)}
 
     @protected.post("/admin/accounts/{account_id}/login")
     async def post_admin_account_login(
@@ -1231,6 +1276,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return _result_payload(runtime, result)
         return {"status": "idle", "account_id": account_id}
 
+    app.add_middleware(ChatConcurrencyMiddleware, registry=runtime.chat_concurrency)
     app.include_router(protected)
     if static_dir.is_dir():
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -1265,7 +1311,8 @@ def _is_chat_error(payload: Any) -> bool:
 
 async def _close_chat_response(stream_cm: Any) -> None:
     try:
-        await asyncio.shield(stream_cm.__aexit__(None, None, None))
+        with anyio.CancelScope(shield=True):
+            await stream_cm.__aexit__(None, None, None)
     except Exception:  # noqa: BLE001
         logger.debug("Failed to close chat response", exc_info=True)
 
@@ -1299,11 +1346,13 @@ async def _chat_stream_events(response: httpx.Response) -> AsyncGenerator[dict[s
 
 async def _stream_chat(
     stream_cm: Any, events: AsyncGenerator[dict[str, Any] | str, None], first: dict[str, Any] | str, model: str,
+    aliases: dict[str, str],
 ):
     metadata: dict[str, Any] = {}
     finished: dict[int, str | None] = {}
     tool_choices: set[int] = set()
     function_choices: set[int] = set()
+    custom_tools = CustomToolStream(aliases) if aliases else None
 
     def normalize_event(event: dict[str, Any]) -> dict[str, Any]:
         normalized = normalize_chunk(event, model)
@@ -1350,6 +1399,8 @@ async def _stream_chat(
                 if not finished:
                     yield format_sse_json(openai_error("Upstream sent [DONE] without any choices", 502))
                     return
+                if custom_tools is not None and (pending := custom_tools.flush()) is not None:
+                    yield format_sse_json(pending)
                 for idx, reason in finished.items():
                     if reason is None:
                         yield format_sse_json({**metadata, "object": "chat.completion.chunk", "choices": [
@@ -1367,7 +1418,8 @@ async def _stream_chat(
                     error["error"]["upstream_code"] = code
                 yield format_sse_json(error)
                 return
-            yield format_sse_json(normalize_event(event))
+            chunk = normalize_event(event)
+            yield format_sse_json(custom_tools.rewrite(chunk) if custom_tools is not None else chunk)
             event = await anext(events, None)
         if finished and all(reason is not None for reason in finished.values()):
             yield format_sse_done()

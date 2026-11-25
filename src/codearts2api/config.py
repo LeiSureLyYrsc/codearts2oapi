@@ -40,6 +40,7 @@ OVERRIDABLE_FIELDS = (
     "oauth_callback_port",
     "pool_strategy",
     "cooldown_seconds",
+    "chat_concurrency_limit",
     "api_key",
 )
 
@@ -183,6 +184,11 @@ class Settings(BaseSettings):
         default=60,
         validation_alias=AliasChoices("CA2A_COOLDOWN_SECONDS", "CODEARTS2API_COOLDOWN_SECONDS"),
     )
+    chat_concurrency_limit: int = Field(
+        default=0,
+        validation_alias=AliasChoices("CA2A_CHAT_CONCURRENCY_LIMIT", "CODEARTS2API_CHAT_CONCURRENCY_LIMIT"),
+        ge=0,
+    )
 
     @field_validator("credential_source")
     @classmethod
@@ -290,4 +296,5 @@ class Settings(BaseSettings):
             "oauth_callback_port": self.oauth_callback_port,
             "pool_strategy": self.pool_strategy,
             "cooldown_seconds": self.cooldown_seconds,
+            "chat_concurrency_limit": self.chat_concurrency_limit,
         }

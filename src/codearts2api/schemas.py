@@ -39,6 +39,7 @@ class AccountCreateRequest(BaseModel):
     sk: str | None = None
     security_token: str | None = None
     project_id: str | None = None
+    chat_concurrency_limit: int = Field(default=0, ge=0)
 
 
 class AccountUpdateRequest(BaseModel):
@@ -49,6 +50,7 @@ class AccountUpdateRequest(BaseModel):
     sk: str | None = None
     security_token: str | None = None
     project_id: str | None = None
+    chat_concurrency_limit: int | None = Field(default=None, ge=0)
 
 
 class OAuthLoginStartRequest(BaseModel):
@@ -57,6 +59,7 @@ class OAuthLoginStartRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     note: str = Field(default="", max_length=200)
     enabled: bool = True
+    chat_concurrency_limit: int = Field(default=0, ge=0)
 
 
 class OpenAIErrorBody(BaseModel):

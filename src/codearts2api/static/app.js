@@ -214,7 +214,7 @@
   function renderAccounts(accounts) {
     const body = $("account-rows");
     if (!accounts.length) {
-      body.innerHTML = '<tr><td colspan="8" class="muted">还没有账号。点击「连接 OAuth 账号」走华为云授权，或添加 AK/SK 账号、导入 Auth 文件。</td></tr>';
+      body.innerHTML = '<tr><td colspan="9" class="muted">还没有账号。点击「连接 OAuth 账号」走华为云授权，或添加 AK/SK 账号、导入 Auth 文件。</td></tr>';
       return;
     }
     body.innerHTML = accounts.map((account) => {
@@ -223,6 +223,8 @@
         ? `<span class="pill warn">冷却至 ${escapeHtml(formatTime(account.cooldown_until))}</span>`
         : "";
       const err = account.last_error ? `<div class="error">${escapeHtml(account.last_error)}</div>` : "";
+      const activeRequests = Number(account.active_chat_requests) || 0;
+      const concurrency = Number(account.chat_concurrency_limit) || 0;
       const quota = quotaCell(account.id, true);
       return `<tr data-id="${escapeHtml(account.id)}">
         <td><strong>${escapeHtml(account.name)}</strong><div class="muted">${escapeHtml(account.id)}</div></td>
@@ -231,8 +233,10 @@
         <td><label class="check"><input type="checkbox" class="toggle-enabled" ${account.enabled ? "checked" : ""}></label></td>
         <td>${statusPill(last.status)}<div class="muted">${escapeHtml(formatTime(account.last_checkin_at))}</div></td>
         <td>${cool || '<span class="pill ok">就绪</span>'}${err}</td>
+        <td><span class="pill ${activeRequests ? "warn" : "ok"}" aria-label="活动对话请求 ${activeRequests}">${activeRequests} 个活动</span><div class="muted">仅此账号 · 上限：${concurrency || "不限"}</div><button type="button" class="btn small concurrency-action" data-act="concurrency" aria-label="设置账号 ${escapeHtml(account.name)} 的并发上限">设置并发</button></td>
         <td data-quota>${quota || '<span class="muted">点「探测」查看额度</span>'}</td>
         <td class="row-actions">
+          <button type="button" class="btn small danger" data-act="release" aria-label="取消 ${escapeHtml(account.name)} 的活动对话请求">取消请求</button>
           <button type="button" class="btn small" data-act="export">导出 Auth</button>
           <button type="button" class="btn small" data-act="edit">编辑</button>
           <button type="button" class="btn small" data-act="test">探测</button>
@@ -280,6 +284,28 @@
       }
       if (act === "edit") {
         openAccountDialog(account);
+        return;
+      }
+      if (act === "concurrency") {
+        openAccountDialog(account, { focusConcurrency: true });
+        return;
+      }
+      if (act === "release") {
+        if (!confirm(`确定通知取消账号「${account.name}」当前仍在运行的网关对话请求吗？活动数是上次刷新的快照，可能已变化。确认后会中断网关正在处理的对话；并发名额会在清理完成后释放。`)) return;
+        const button = document.querySelector(`tr[data-id="${CSS.escape(account.id)}"] [data-act="release"]`);
+        if (button) { button.disabled = true; button.setAttribute("aria-busy", "true"); button.textContent = "发送中…"; }
+        try {
+          const result = await api(`admin/accounts/${encodeURIComponent(account.id)}/release-requests`, { method: "POST" });
+          const cancelled = Number(result.cancelled) || 0;
+          toast(cancelled ? `已通知取消 ${cancelled} 个活动请求；并发名额将在清理完成后释放` : "没有活动请求需要取消");
+          await loadAccounts();
+        } finally {
+          if (button && button.isConnected) {
+            button.removeAttribute("aria-busy");
+            button.textContent = "取消请求";
+            button.disabled = false;
+          }
+        }
         return;
       }
       if (act === "delete") {
@@ -346,7 +372,7 @@
     finally { event.target.value = ""; }
   });
 
-  function openAccountDialog(account) {
+  function openAccountDialog(account, options = {}) {
     const form = $("account-form");
     form.reset();
     $("account-error").classList.add("hidden");
@@ -359,6 +385,7 @@
     form.name.value = account ? account.name : "";
     form.note.value = account ? account.note : "";
     form.enabled.checked = account ? account.enabled : true;
+    form.chat_concurrency_limit.value = account ? (account.chat_concurrency_limit ?? 0) : 0;
     form.project_id.value = account && account.project_id ? account.project_id : "";
     $("account-dialog-title").textContent = isEdit ? `编辑账号 · ${account.name}` : "添加 AK/SK 账号";
     $("aksk-fields").hidden = isOauth;
@@ -368,6 +395,7 @@
     form.ak.placeholder = isEdit ? "留空表示保持原值" : "";
     form.sk.placeholder = isEdit ? "留空表示保持原值" : "";
     accountDialog.showModal();
+    if (options.focusConcurrency) form.chat_concurrency_limit.focus();
   }
 
   $("btn-add-aksk").addEventListener("click", () => openAccountDialog(null));
@@ -383,6 +411,7 @@
       kind,
       enabled: form.enabled.checked,
       note: form.note.value,
+      chat_concurrency_limit: Number(form.chat_concurrency_limit.value),
     };
     if (kind === "aksk") {
       if (form.ak.value) payload.ak = form.ak.value;
@@ -519,7 +548,7 @@
     auth.loginId = null;
     if (previous) cancelLogin(previous);
     auth.draft = account
-      ? { name: account.name, note: account.note || "", enabled: account.enabled }
+      ? { name: account.name, note: account.note || "", enabled: account.enabled, chat_concurrency_limit: account.chat_concurrency_limit || 0 }
       : null;
     auth.submitting = false;
     auth.finished = false;
@@ -585,6 +614,7 @@
           form.name.value = auth.draft.name || "";
           form.note.value = auth.draft.note || "";
           form.enabled.checked = auth.draft.enabled !== false;
+          form.chat_concurrency_limit.value = auth.draft.chat_concurrency_limit ?? 0;
         }
         $("login-start-error").textContent = err.message;
         $("login-start-error").classList.remove("hidden");
@@ -698,7 +728,7 @@
       form.name.focus();
       return;
     }
-    auth.draft = { name, note: form.note.value.trim(), enabled: form.enabled.checked };
+    auth.draft = { name, note: form.note.value.trim(), enabled: form.enabled.checked, chat_concurrency_limit: Number(form.chat_concurrency_limit.value) };
     startAuthFlow(auth.gen);
   });
 
@@ -893,6 +923,7 @@
       if (name === "credential_source" && value === "env") value = "aksk";
       form[name].value = value == null ? "" : value;
     });
+    form.chat_concurrency_limit.value = config.chat_concurrency_limit ?? 0;
     form.scheduler_enabled.checked = Boolean(config.scheduler_enabled);
     form.checkin_run_on_startup.checked = Boolean(config.checkin_run_on_startup);
     form.checkin_claim_all.checked = Boolean(config.checkin_claim_all);
@@ -908,6 +939,7 @@
       checkin_cron: form.checkin_cron.value,
       campaign_type: form.campaign_type.value,
       model_cache_ttl: Number(form.model_cache_ttl.value),
+      chat_concurrency_limit: Number(form.chat_concurrency_limit.value),
       pool_strategy: form.pool_strategy.value,
       cooldown_seconds: Number(form.cooldown_seconds.value),
       log_level: form.log_level.value,
@@ -941,8 +973,24 @@
 
   async function loadAccounts() {
     const data = await api("admin/accounts");
-    renderAccounts(data.accounts || []);
+    const globalActive = Number(data.active_chat_requests) || 0;
+    const globalLimit = Number(data.chat_concurrency_limit) || 0;
+    $("global-concurrency-status").textContent = `全站活动请求 ${globalActive} / 上限 ${globalLimit || "不限"}`;
+    renderAccounts((data.accounts || []).map((account) => Object.assign({}, account, {
+      active_chat_requests: account.active_chat_requests ?? 0,
+      chat_concurrency_limit: account.chat_concurrency_limit ?? 0,
+    })));
   }
+
+  $("btn-refresh-accounts").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    button.textContent = "刷新中…";
+    try { await loadAccounts(); toast("账号活动请求状态已刷新"); }
+    catch (err) { toast(`刷新失败：${err.message}`); }
+    finally { button.disabled = false; button.removeAttribute("aria-busy"); button.textContent = "刷新状态"; }
+  });
 
   async function loadStatus() {
     const data = await api("admin/status");

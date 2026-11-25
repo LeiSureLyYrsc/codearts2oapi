@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import httpx
 import json
+
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from codearts2api.app import create_app
@@ -39,6 +41,88 @@ def test_http_400_is_json_error_not_sse(settings: Settings) -> None:
         assert response.status_code == 400
         assert response.headers["content-type"].startswith("application/json")
         assert response.json()["error"]["message"] == "bad request"
+    finally:
+        client.__exit__(None, None, None)
+
+
+@pytest.mark.parametrize(("text", "code", "status"), [
+    ("The request param is invalid, Please check it", "InferHub.001001005.400", 400),
+    ("并发会话数已达上限(3个)，请关闭部分会话后重试。", None, 429),
+])
+def test_first_sse_error_is_a_real_http_error(settings, text, code, status):
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        error = {"error_msg": text, **({"error_code": code} if code else {})}
+        return httpx.Response(
+            200, text=f": heartbeat\n\ndata: {json.dumps(error)}\n\n", headers={"Content-Type": "text/event-stream"},
+        )
+
+    client = _client(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        response = _post(client)
+        assert response.status_code == status
+        assert response.json()["error"]["message"] == text
+        assert response.json()["error"]["code"] == (code or str(status))
+        assert len(requests) == 1
+    finally:
+        client.__exit__(None, None, None)
+
+
+def test_opencode_tool_call_round_trip_uses_same_signed_session(settings):
+    requests = []
+
+    async def handler(request):
+        payload = json.loads(request.content)
+        requests.append(request)
+        assert request.headers["user-session-id"] == "ses_root"
+        assert "user-session-id" in request.headers["Authorization"].split("SignedHeaders=")[1].split(",")[0].split(";")
+        assert payload.get("max_tokens") == 4096 and "max_completion_tokens" not in payload
+        assert payload.get("tool_stream") is True
+        assert payload["stream_options"] == {"include_usage": True}
+        if len(requests) == 1:
+            first = {"tool_calls": [{
+                "index": 0, "id": "call_fixture", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":"},
+            }]}
+            second = {"tool_calls": [{"index": 0, "function": {"arguments": "\"hello\"}"}}]}
+            chunks = (first, second)
+        else:
+            assistant, tool = payload["messages"][-2:]
+            assert assistant["content"] == assistant["reasoning_content"] == ""
+            assert assistant["tool_calls"][0]["function"]["arguments"] == '{"q":"hello"}'
+            assert tool == {"role": "tool", "tool_call_id": "call_fixture", "content": "found"}
+            chunks = ({"content": "done"},)
+        body = "".join(
+            f'data: {json.dumps({"choices": [{"index": 0, "delta": delta}]})}\n\n' for delta in chunks
+        )
+        return httpx.Response(200, text=body + "data: [DONE]\n\n", headers={"Content-Type": "text/event-stream"})
+
+    client = _client(settings, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    try:
+        headers = {"Authorization": "Bearer test-local-key", "X-Session-Affinity": "ses_root"}
+        payload = {
+            "model": "codearts/DeepSeek-V4-Flash", "stream": True, "max_completion_tokens": 4096,
+            "stream_options": {"include_usage": True},
+            "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+            "messages": [{"role": "user", "content": "find hello"}],
+        }
+        rsp = client.post("/v1/chat/completions", headers={**headers, "X-OpenCode-Session-Id": "ses_child_a"}, json=payload)
+        assert rsp.status_code == 200
+        chunks = [json.loads(line[6:])["choices"][0] for line in rsp.text.splitlines() if line.startswith("data: {")]
+        assert chunks[-1]["finish_reason"] == "tool_calls"
+        call = chunks[0]["delta"]["tool_calls"][0]
+        arguments = call["function"]["arguments"] + chunks[1]["delta"]["tool_calls"][0]["function"]["arguments"]
+        payload["messages"].extend([
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": call["id"], "type": "function", "function": {"name": call["function"]["name"], "arguments": arguments},
+            }]},
+            {"role": "tool", "tool_call_id": call["id"], "content": [{"type": "text", "text": "found"}]},
+        ])
+        rsp = client.post("/v1/chat/completions", headers={**headers, "X-OpenCode-Session-Id": "ses_child_b"}, json=payload)
+        assert rsp.status_code == 200 and '"finish_reason": "stop"' in rsp.text
+        assert len(requests) == 2
+        assert requests[0].headers["x-snap-traceid"] != requests[1].headers["x-snap-traceid"]
     finally:
         client.__exit__(None, None, None)
 

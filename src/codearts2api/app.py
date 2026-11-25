@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,7 +29,8 @@ from codearts2api.chat import (
     normalize_completion,
     openai_error,
 )
-from codearts2api.client import SnapAccessClient, UpstreamError
+from codearts2api.chat_request import prepare_chat_payload
+from codearts2api.client import SnapAccessClient, UpstreamError, chat_error_status, upstream_error_code
 from codearts2api.config import Settings
 from codearts2api.credentials import CredentialResolver
 from codearts2api.logging_setup import configure_logging
@@ -63,6 +66,16 @@ from codearts2api.schemas import (
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+CHAT_SESSION_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+
+
+def _chat_session_id(request: Request) -> str | None:
+    # OpenCode's affinity represents the root/parent conversation, not a model turn.
+    for name in ("x-session-affinity", "x-opencode-session", "x-session-id", "x-opencode-session-id"):
+        value = request.headers.get(name, "").strip()
+        if CHAT_SESSION_ID.fullmatch(value):
+            return value
+    return None
 
 # Retain finished login results so status polling and a duplicate submit never
 # consume each other's success, then forget them.
@@ -396,6 +409,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         model = strip_codearts_prefix(body.model)
         upstream_payload = body.model_dump(exclude_none=True)
         upstream_payload["model"] = model
+        upstream_payload = prepare_chat_payload(upstream_payload)
+        session_id = _chat_session_id(request)
 
         if body.stream:
             try:
@@ -404,22 +419,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     resolver=runtime.resolver,
                     pool=runtime.pool,
                     payload=upstream_payload,
+                    session_id=session_id,
                 )
             except UpstreamError as exc:
                 status = exc.status_code if 400 <= exc.status_code < 600 else 502
                 return JSONResponse(
                     status_code=status,
-                    content=openai_error(str(exc), status),
+                    content=openai_error(str(exc), status, code=exc.code),
                 )
             except httpx.HTTPError:
                 return JSONResponse(
                     status_code=502,
                     content=openai_error("Upstream stream connection failed", 502),
                 )
-            content_type = response.headers.get("content-type", "").lower()
-            if "text/event-stream" not in content_type and (
-                "application/json" in content_type or "text/html" in content_type
-            ):
+            media_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+            if media_type in ("application/json", "text/html") or media_type.endswith("+json"):
                 try:
                     raw = bytearray()
                     if "json" in content_type:
@@ -432,18 +446,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except (httpx.HTTPError, ValueError):
                     parsed = None
                 finally:
-                    try:
-                        await stream_cm.__aexit__(None, None, None)
-                    except Exception:  # noqa: BLE001
-                        logger.debug("Failed to close non-stream chat response", exc_info=True)
+                    await _close_chat_response(stream_cm)
+                status = chat_error_status(parsed, 502) if _is_chat_error(parsed) else 502
                 return JSONResponse(
-                    status_code=502,
+                    status_code=status,
                     content=openai_error(
-                        _safe_upstream_error(parsed) or "Upstream returned a non-stream response", 502
+                        _safe_upstream_error(parsed) or "Upstream returned a non-stream response",
+                        status,
+                        code=upstream_error_code(parsed),
                     ),
                 )
+            events = _chat_stream_events(response)
+            handoff = False
+            try:
+                # InferHub also returns request errors as the first event of a
+                # HTTP 200. Classify them before HTTP headers are committed.
+                first = await anext(events, None)
+                if first is None or first == "[DONE]":
+                    return JSONResponse(status_code=502, content=openai_error("Upstream sent an empty stream", 502))
+                if _is_chat_error(first):
+                    status = chat_error_status(first, 502)
+                    return JSONResponse(
+                        status_code=status,
+                        content=openai_error(
+                            _safe_upstream_error(first) or "Upstream stream returned an error",
+                            status,
+                            code=upstream_error_code(first),
+                        ),
+                    )
+                handoff = True
+            except (httpx.HTTPError, ValueError):
+                return JSONResponse(
+                    status_code=502, content=openai_error("Could not read the upstream stream", 502),
+                )
+            finally:
+                if not handoff:
+                    await events.aclose()
+                    await _close_chat_response(stream_cm)
             return StreamingResponse(
-                _stream_chat(stream_cm, response, model),
+                _stream_chat(stream_cm, events, first, model),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -458,12 +499,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 resolver=runtime.resolver,
                 pool=runtime.pool,
                 payload=upstream_payload,
+                session_id=session_id,
             )
         except UpstreamError as exc:
             return JSONResponse(
                 status_code=exc.status_code if exc.status_code >= 400 else 502,
-                content=openai_error(str(exc), exc.status_code),
+                content=openai_error(str(exc), exc.status_code, code=exc.code),
             )
+        if _is_chat_error(raw):
+            status = chat_error_status(raw, 502)
+            return JSONResponse(status_code=status, content=openai_error(
+                _safe_upstream_error(raw) or "Upstream returned a chat error", status, code=upstream_error_code(raw),
+            ))
         return normalize_completion(raw, model)
 
     @protected.post("/admin/checkin")
@@ -1196,36 +1243,70 @@ def _safe_upstream_error(payload: Any) -> str | None:
     # Follow the conventional OpenAI error.message first; never return an opaque
     # upstream envelope (which can contain request details or credentials).
     error = payload.get("error")
-    if isinstance(error, dict) and isinstance(error.get("message"), str):
-        return error["message"][:1000]
-    if isinstance(payload.get("error_msg"), str):
-        code = payload.get("error_code")
-        return f'{payload["error_msg"][:1000]} (code {code})' if code is not None else payload["error_msg"][:1000]
-    if isinstance(payload.get("message"), str):
-        return payload["message"][:1000]
+    for source in (error, payload):
+        if isinstance(source, str) and source.strip():
+            return source[:1000]
+        if isinstance(source, dict):
+            for key in ("message", "error_msg", "errorMsg"):
+                message = source.get(key)
+                if isinstance(message, str) and message.strip():
+                    return message[:1000]
     return None
 
 
-async def _stream_chat(stream_cm: Any, response: httpx.Response, model: str):
+def _is_chat_error(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    code = upstream_error_code(payload)
+    return bool(payload.get("error") or payload.get("error_msg") or payload.get("errorMsg")) or bool(
+        code and code not in {"0", "00", "0000", "200", "OK", "ok", "SUCCESS", "success"}
+    )
+
+
+async def _close_chat_response(stream_cm: Any) -> None:
+    try:
+        await asyncio.shield(stream_cm.__aexit__(None, None, None))
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to close chat response", exc_info=True)
+
+
+async def _chat_stream_events(response: httpx.Response) -> AsyncGenerator[dict[str, Any] | str, None]:
+    """Read SSE events (and bare NDJSON records) without committing downstream headers."""
+    data_lines: list[str] = []
+
+    def parse_event(data: str) -> dict[str, Any] | str:
+        if data.strip() == "[DONE]":
+            return "[DONE]"
+        payload = json.loads(data)
+        if not isinstance(payload, dict):
+            raise ValueError("Expected an upstream chat object")
+        return payload
+
+    async for line in response.aiter_lines():
+        if not line:
+            if data_lines:
+                data = "\n".join(data_lines).strip()
+                data_lines.clear()
+                if data:
+                    yield parse_event(data)
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].removeprefix(" "))
+        elif not data_lines and line.strip() and not line.startswith((":", "event:", "id:", "retry:")):
+            yield parse_event(line)
+    if data_lines and (data := "\n".join(data_lines).strip()):
+        yield parse_event(data)
+
+
+async def _stream_chat(
+    stream_cm: Any, events: AsyncGenerator[dict[str, Any] | str, None], first: dict[str, Any] | str, model: str,
+):
     metadata: dict[str, Any] = {}
     finished: dict[int, str | None] = {}
     tool_choices: set[int] = set()
     function_choices: set[int] = set()
-    data_lines: list[str] = []
 
-    def process_data(data: str) -> tuple[str | None, dict[str, Any] | None]:
-        data = data.strip()
-        if data == "[DONE]":
-            return "done", None
-        try:
-            parsed = json.loads(data)
-        except ValueError:
-            return "malformed", None
-        if isinstance(parsed, dict) and (
-            "error" in parsed or parsed.get("error_msg") or parsed.get("error_code")
-        ):
-            return "error", parsed
-        normalized = normalize_chunk(parsed, model)
+    def normalize_event(event: dict[str, Any]) -> dict[str, Any]:
+        normalized = normalize_chunk(event, model)
         if isinstance(normalized.get("id"), str):
             metadata.setdefault("id", normalized["id"])
         if isinstance(normalized.get("created"), int):
@@ -1234,26 +1315,26 @@ async def _stream_chat(stream_cm: Any, response: httpx.Response, model: str):
             metadata.setdefault("model", normalized["model"])
         choices = normalized.get("choices")
         if not isinstance(choices, list):
-            return "malformed", None
+            raise ValueError("Invalid choices")
         for choice in choices:
             if not isinstance(choice, dict):
-                return "malformed", None
+                raise ValueError("Invalid choice")
             idx = choice.get("index", 0)
             if not isinstance(idx, int):
-                return "malformed", None
+                raise ValueError("Invalid choice index")
             finished.setdefault(idx, None)
             delta = choice.get("delta")
             if delta is None and choice.get("finish_reason") is not None:
                 choice["delta"] = delta = {}
             if not isinstance(delta, dict):
-                return "malformed", None
+                raise ValueError("Invalid choice delta")
             if delta.get("tool_calls"):
                 tool_choices.add(idx)
             if delta.get("function_call"):
                 function_choices.add(idx)
             if choice.get("finish_reason") is not None:
                 finished[idx] = choice["finish_reason"]
-        return "chunk", normalized
+        return normalized
 
     def inferred_finish(index: int) -> str:
         if index in function_choices:
@@ -1262,65 +1343,32 @@ async def _stream_chat(stream_cm: Any, response: httpx.Response, model: str):
             return "tool_calls"
         return "stop"
 
-    async def close_stream() -> None:
-        try:
-            await asyncio.shield(stream_cm.__aexit__(None, None, None))
-        except Exception:  # noqa: BLE001
-            logger.debug("Failed to close chat stream", exc_info=True)
-
     try:
-        def consume_data(data: str) -> tuple[list[str], bool]:
-            result, value = process_data(data)
-            if result == "done":
+        event: dict[str, Any] | str | None = first
+        while event is not None:
+            if event == "[DONE]":
                 if not finished:
-                    return [format_sse_json(openai_error("Upstream sent [DONE] without any choices", 502))], True
-                output = []
+                    yield format_sse_json(openai_error("Upstream sent [DONE] without any choices", 502))
+                    return
                 for idx, reason in finished.items():
                     if reason is None:
-                        chunk = {**metadata, "object": "chat.completion.chunk", "choices": [
-                            {"index": idx, "delta": {}, "finish_reason": inferred_finish(idx)}
-                        ]}
-                        output.append(format_sse_json(chunk))
-                output.append(format_sse_done())
-                return output, True
-            if result == "malformed":
-                return [format_sse_json(openai_error("Malformed upstream stream data", 502))], True
-            if result == "error":
-                message = _safe_upstream_error(value) or "Upstream stream returned an error"
-                return [format_sse_json(openai_error(message, 502))], True
-            return [format_sse_json(value)], False
-
-        async for raw_line in response.aiter_lines():
-            line = raw_line.rstrip("\r")
-            if line == "":
-                if data_lines:
-                    data = "\n".join(data_lines)
-                    data_lines.clear()
-                    output, stop = consume_data(data)
-                else:
-                    continue
-            elif line.startswith("data:"):
-                data_lines.append(line[5:].lstrip(" "))
-                continue
-            elif line.startswith((":", "event:", "id:", "retry:")):
-                continue
-            elif not data_lines:
-                # Mislabeled NDJSON: process each bare record independently,
-                # including records separated by blank lines.
-                output, stop = consume_data(line)
-            else:
-                # Non-SSE text inside a pending SSE event is not part of its data.
-                continue
-            for item in output:
-                yield item
-            if stop:
+                        yield format_sse_json({**metadata, "object": "chat.completion.chunk", "choices": [
+                            {"index": idx, "delta": {}, "finish_reason": inferred_finish(idx)},
+                        ]})
+                yield format_sse_done()
                 return
-        if data_lines:
-            output, stop = consume_data("\n".join(data_lines))
-            for item in output:
-                yield item
-            if stop:
+            if _is_chat_error(event):
+                status = chat_error_status(event, 502)
+                message = _safe_upstream_error(event) or "Upstream stream returned an error"
+                error = openai_error(message, status)
+                # OpenCode treats numeric SSE error.code as the HTTP-equivalent status.
+                error["error"]["code"] = status
+                if code := upstream_error_code(event):
+                    error["error"]["upstream_code"] = code
+                yield format_sse_json(error)
                 return
+            yield format_sse_json(normalize_event(event))
+            event = await anext(events, None)
         if finished and all(reason is not None for reason in finished.values()):
             yield format_sse_done()
         else:
@@ -1328,8 +1376,11 @@ async def _stream_chat(stream_cm: Any, response: httpx.Response, model: str):
     except httpx.HTTPError:
         logger.warning("Upstream chat stream interrupted")
         yield format_sse_json(openai_error("Upstream stream interrupted", 502))
+    except ValueError:
+        yield format_sse_json(openai_error("Malformed upstream stream data", 502))
     finally:
-        await close_stream()
+        await events.aclose()
+        await _close_chat_response(stream_cm)
 
 
 # Default app instance for ``uvicorn codearts2api.app:app`` / ``python -m codearts2api``.

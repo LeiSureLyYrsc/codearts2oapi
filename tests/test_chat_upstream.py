@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from codearts2api.client import SnapAccessClient, UpstreamError
+from codearts2api.client import SnapAccessClient, UpstreamError, chat_error_status, upstream_error_code
 from codearts2api.credentials import ResolvedCredential
 from codearts2api.operations import open_chat_stream_with_failover, post_chat_with_failover
 
@@ -20,7 +20,10 @@ class _Resolver:
 
 class _Pool:
     def __init__(self) -> None:
-        self.accounts = [object(), object()]
+        self.accounts = [
+            type("TestAccount", (), {"id": f"account-{index}", "name": f"Test {index}"})()
+            for index in (1, 2)
+        ]
         self.cooldowns: list[tuple[str, int]] = []
 
     def iter_candidates(self):
@@ -101,4 +104,88 @@ async def test_sse_error_envelope_is_decoded_and_response_closed(settings) -> No
             payload={"model": "M", "stream": True},
         )
     assert error.value.status_code == 400
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_session_id_is_signed_for_post_and_stream(settings) -> None:
+    seen: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.headers.get("accept") == "text/event-stream":
+            return httpx.Response(200, text="data: [DONE]\n\n", headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={"ok": True})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = SnapAccessClient(settings, http)
+    credential = _credential()
+    await client.post_chat({"model": "M"}, credential=credential, session_id="opencode-chat-1")
+    stream_cm = client.stream_chat(
+        {"model": "M", "stream": True}, credential=credential, session_id="opencode-chat-2"
+    )
+    async with stream_cm as response:
+        assert response.status_code == 200
+
+    assert [request.headers["user-session-id"] for request in seen] == ["opencode-chat-1", "opencode-chat-2"]
+    for request in seen:
+        authorization = request.headers["authorization"].lower()
+        assert "user-session-id" in authorization
+        assert "x-snap-traceid" in authorization
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_failover_threads_session_id(settings) -> None:
+    seen: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["user-session-id"])
+        return httpx.Response(200, json={"ok": True})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = SnapAccessClient(settings, http)
+    await post_chat_with_failover(
+        client=client,
+        resolver=_Resolver(_credential()),
+        pool=_Pool(),
+        payload={"model": "M"},
+        session_id="same-session",
+    )
+    assert seen == ["same-session"]
+    await http.aclose()
+
+
+def test_in_band_error_code_and_status_helpers() -> None:
+    inferhub = {"error": {"code": "InferHub.001001005.400", "message": "invalid param"}}
+    assert upstream_error_code(inferhub) == "InferHub.001001005.400"
+    assert chat_error_status(inferhub, 200) == 400
+
+    concurrency = {"error_msg": "并发会话数已达上限(3个)"}
+    assert chat_error_status(concurrency, 200) == 429
+    assert chat_error_status({"message": "ordinary business error"}, 200) == 200
+    assert upstream_error_code({"errorCode": "bad code !"}) is None
+
+
+@pytest.mark.asyncio
+async def test_session_limit_429_does_not_fail_over(settings) -> None:
+    seen = 0
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal seen
+        seen += 1
+        return httpx.Response(429, json={"error_msg": "并发会话数已达上限(3个)"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    pool = _Pool()
+    with pytest.raises(UpstreamError) as error:
+        await post_chat_with_failover(
+            client=SnapAccessClient(settings, http),
+            resolver=_Resolver(_credential()),
+            pool=pool,
+            payload={"model": "M"},
+        )
+    assert error.value.status_code == 429
+    assert seen == 1
+    assert pool.cooldowns == []
     await http.aclose()

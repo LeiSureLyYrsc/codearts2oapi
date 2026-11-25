@@ -105,6 +105,8 @@ https://snap-access.cn-north-4.myhuaweicloud.com
 
 `GET /v1/models` 从上游 `GET /v1/model/builtin` 动态拉取，默认缓存 60 秒，`?refresh=true` 可强制刷新。只对外暴露 `enable=true` 的模型；若存在 `display_enabled` 字段，也必须为 true。对话请求使用裸模型 id（例如 `GLM-5.2`）；若客户端传来 `codearts/` 前缀，会去掉后再转给上游。
 
+OpenCode 请使用 OpenAI 兼容供应商，将 `baseURL` 指向网关的 `/v1`，并为确实支持工具调用的模型启用 tools。网关会按模型转换 token 上限字段，并复用 OpenCode 提供的会话标识。若上游明确报「并发会话数已达上限」，请停止不用的会话后重试；网关不会换账号绕过此限制。
+
 ### 5. 每日签到
 
 官方活动「每日签到得积分」面向已升级积分计费的个人版用户。本网关会先查套餐：`package.is_credit_package === true` 视为积分账号，否则返回 `ineligible`，不领取。

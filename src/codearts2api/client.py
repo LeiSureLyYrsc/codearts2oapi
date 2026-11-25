@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 from urllib.parse import quote, urlencode, urljoin
@@ -31,10 +32,11 @@ def json_body(payload: Any) -> bytes:
 
 
 class UpstreamError(Exception):
-    def __init__(self, message: str, status_code: int, payload: Any = None) -> None:
+    def __init__(self, message: str, status_code: int, payload: Any = None, code: str | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.payload = payload
+        self.code = code if code is not None else upstream_error_code(payload)
 
 
 class SnapAccessClient:
@@ -195,20 +197,32 @@ class SnapAccessClient:
             credential=credential,
         )
 
-    async def post_chat(self, payload: dict[str, Any], credential: ResolvedCredential | None = None) -> Any:
+    async def post_chat(
+        self,
+        payload: dict[str, Any],
+        credential: ResolvedCredential | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> Any:
         body, _status = await self.request_json(
             "POST", CHAT_PATH, payload=payload, credential=credential,
-            headers=_chat_headers(payload), sign_language=True,
+            headers=_chat_headers(payload, session_id=session_id), sign_language=True,
         )
         return body
 
-    def stream_chat(self, payload: dict[str, Any], credential: ResolvedCredential | None = None) -> httpx.Response:
+    def stream_chat(
+        self,
+        payload: dict[str, Any],
+        credential: ResolvedCredential | None = None,
+        *,
+        session_id: str | None = None,
+    ) -> httpx.Response:
         """Return an async context manager for a signed streaming POST."""
         body = json_body(payload)
         url = self._build_url(CHAT_PATH)
         cred = self._credential(credential)
         headers = self.sign(
-            "POST", url, body=body, headers=_chat_headers(payload), credential=cred,
+            "POST", url, body=body, headers=_chat_headers(payload, session_id=session_id), credential=cred,
             sign_language=True,
         )
         headers.setdefault("Accept", "text/event-stream")
@@ -306,8 +320,48 @@ def _error_message(payload: Any, status_code: int) -> str:
     return f"Upstream request failed with HTTP {status_code}"
 
 
-def _chat_headers(payload: dict[str, Any]) -> dict[str, str]:
+_SAFE_UPSTREAM_CODE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+
+
+def upstream_error_code(payload: Any) -> str | None:
+    """Extract a sanitized Huawei business code from common error envelopes."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("error_code", "errorCode"):
+        code = payload.get(key)
+        if isinstance(code, (str, int)) and not isinstance(code, bool):
+            text = str(code)
+            if _SAFE_UPSTREAM_CODE.fullmatch(text):
+                return text
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, (str, int)) and not isinstance(code, bool):
+            text = str(code)
+            if _SAFE_UPSTREAM_CODE.fullmatch(text):
+                return text
+    return None
+
+
+def chat_error_status(payload: Any, default: int) -> int:
+    """Infer HTTP status for an in-band chat error without guessing generic errors."""
+    if not isinstance(payload, dict):
+        return default
+    message = _error_message(payload, default)
+    if "并发会话数" in message and "上限" in message:
+        return 429
+    code = upstream_error_code(payload)
+    if code and code.lower().startswith("inferhub."):
+        suffix = code.rsplit(".", 1)[-1]
+        if suffix in {"400", "401", "403", "404", "429", "500", "502", "503", "504"}:
+            return int(suffix)
+    return default
+
+
+def _chat_headers(payload: dict[str, Any], *, session_id: str | None = None) -> dict[str, str]:
     headers = {"x-snap-traceid": uuid.uuid4().hex}
+    if session_id is not None:
+        headers["user-session-id"] = session_id
     for field in ("model", "model_id", "model-id"):
         value = payload.get(field)
         if value is not None and str(value):

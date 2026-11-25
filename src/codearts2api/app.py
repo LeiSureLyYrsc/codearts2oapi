@@ -39,7 +39,14 @@ from codearts2api.chat_concurrency import (
 )
 from codearts2api.chat_request import ChatPayloadError, custom_tool_aliases, prepare_chat_payload
 from codearts2api.chat_tool_response import CustomToolStream, restore_completion_tools
-from codearts2api.client import SnapAccessClient, UpstreamError, chat_error_status, upstream_error_code
+from codearts2api.client import (
+    SnapAccessClient,
+    UpstreamError,
+    chat_error_status,
+    is_session_limit_error,
+    is_session_limit_payload,
+    upstream_error_code,
+)
 from codearts2api.config import Settings
 from codearts2api.credentials import CredentialResolver
 from codearts2api.logging_setup import configure_logging
@@ -71,6 +78,7 @@ from codearts2api.schemas import (
     CheckinRequest,
     OAuthLoginStartRequest,
 )
+from codearts2api.session_limit import next_session_limit_delay
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +115,19 @@ def _chat_queue_error(result: QueueResult) -> JSONResponse:
     return JSONResponse(
         status_code=429, content=openai_error("Timed out waiting for an available chat request slot", 429),
     )
+
+
+class _SessionLimitSignal(Exception):
+    """Internal: the upstream explicitly reported its concurrent-session cap.
+
+    Raised only while no response content has reached the client, so the
+    request may be re-issued; the chat endpoint owns the polling policy.
+    """
+
+    def __init__(self, error: UpstreamError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
 
 # Retain finished login results so status polling and a duplicate submit never
 # consume each other's success, then forget them.
@@ -507,9 +528,151 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return JSONResponse(status_code=400, content=openai_error(str(exc), 400, code="invalid_tool_request"))
         session_id = _chat_session_id(request)
 
-        if body.stream:
+        # Upstream concurrent-session-cap polling. The global ticket is kept
+        # for the whole loop, so new arrivals still hit the full-gateway 429
+        # instead of piling up behind a request that may wait a long time;
+        # the account slot is released between polls, so a retry never
+        # bypasses the local account cap. Backoff deadlines live in this
+        # request only (never keyed by the client session id) and there is no
+        # total attempt or time cap.
+        limit_backoff: dict[str, float] = {}
+        limit_attempts = 0
+
+        def poll_candidates() -> list[Account] | None:
+            """Accounts that may be tried right now, best first.
+
+            Re-reads the pool every round so config edits reach a waiting
+            request. General cooldowns keep their existing meaning (including
+            the all-cooled-down fallback in ``peek_candidates``); on top of
+            that, accounts still inside their per-request session-limit
+            backoff and accounts at their local cap are skipped. ``None``
+            means accounts exist but none can run yet.
+            """
+            now = time.monotonic()
+            ready = [
+                account
+                for account in runtime.pool.peek_candidates()
+                if limit_backoff.get(account.id, 0.0) <= now
+                and (
+                    account.chat_concurrency_limit <= 0
+                    or concurrency.active_count(account.id) < account.chat_concurrency_limit
+                )
+            ]
+            if not ready:
+                return None
+            order = {account.id: index for index, account in enumerate(runtime.pool.iter_candidates())}
+            ready.sort(key=lambda account: order.get(account.id, len(order)))
+            return ready
+
+        async def attempt_once() -> Any:
+            """One upstream attempt plus downstream response classification.
+
+            Returns the response, or raises ``_SessionLimitSignal`` when the
+            provider cap was reported before any content reached the client.
+            The explicit-cap check runs before the generic chat-error gate so
+            envelopes carrying only ``message``/``msg`` are caught too; it
+            reads top-level error fields only, never generated choices text.
+            """
+            if body.stream:
+                try:
+                    stream_cm, response = await open_chat_stream_with_failover(
+                        client=runtime.snap(),
+                        resolver=runtime.resolver,
+                        pool=runtime.pool,
+                        payload=upstream_payload,
+                        session_id=session_id,
+                        ticket=ticket,
+                        candidates=attempt_candidates or None,
+                    )
+                except UpstreamError as exc:
+                    if is_session_limit_error(exc):
+                        raise _SessionLimitSignal(exc) from exc
+                    status = exc.status_code if 400 <= exc.status_code < 600 else 502
+                    return JSONResponse(
+                        status_code=status,
+                        content=openai_error(str(exc), status, code=exc.code),
+                    )
+                except httpx.HTTPError:
+                    return JSONResponse(
+                        status_code=502,
+                        content=openai_error("Upstream stream connection failed", 502),
+                    )
+                media_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
+                if media_type in ("application/json", "text/html") or media_type.endswith("+json"):
+                    try:
+                        raw = bytearray()
+                        if media_type != "text/html":
+                            async for chunk in response.aiter_bytes(chunk_size=8192):
+                                if len(raw) + len(chunk) > 64 * 1024:
+                                    raw.clear()
+                                    break
+                                raw.extend(chunk)
+                        parsed = json.loads(raw) if raw else None
+                    except (httpx.HTTPError, ValueError):
+                        parsed = None
+                    finally:
+                        await _close_chat_response(stream_cm)
+                    if is_session_limit_payload(parsed):
+                        raise _SessionLimitSignal(UpstreamError(
+                            _safe_upstream_error(parsed) or "Upstream returned a non-stream response",
+                            chat_error_status(parsed, 502),
+                            parsed,
+                        ))
+                    status = chat_error_status(parsed, 502) if _is_chat_error(parsed) else 502
+                    return JSONResponse(
+                        status_code=status,
+                        content=openai_error(
+                            _safe_upstream_error(parsed) or "Upstream returned a non-stream response",
+                            status,
+                            code=upstream_error_code(parsed),
+                        ),
+                    )
+                events = _chat_stream_events(response)
+                resources = _ChatStreamResources(stream_cm, events)
+                handoff = False
+                try:
+                    # InferHub also returns request errors as the first event of a
+                    # HTTP 200. Classify them before HTTP headers are committed.
+                    first = await anext(events, None)
+                    if first is None or first == "[DONE]":
+                        return JSONResponse(status_code=502, content=openai_error("Upstream sent an empty stream", 502))
+                    if is_session_limit_payload(first):
+                        raise _SessionLimitSignal(UpstreamError(
+                            _safe_upstream_error(first) or "Upstream stream returned an error",
+                            chat_error_status(first, 502),
+                            first,
+                        ))
+                    if _is_chat_error(first):
+                        status = chat_error_status(first, 502)
+                        return JSONResponse(
+                            status_code=status,
+                            content=openai_error(
+                                _safe_upstream_error(first) or "Upstream stream returned an error",
+                                status,
+                                code=upstream_error_code(first),
+                            ),
+                        )
+                    handoff = True
+                except (httpx.HTTPError, ValueError):
+                    return JSONResponse(
+                        status_code=502, content=openai_error("Could not read the upstream stream", 502),
+                    )
+                finally:
+                    if not handoff:
+                        await resources.aclose()
+                return _ChatStreamingResponse(
+                    _stream_chat(resources, events, first, model, aliases),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                    resources=resources,
+                )
+
             try:
-                stream_cm, response = await open_chat_stream_with_failover(
+                raw = await post_chat_with_failover(
                     client=runtime.snap(),
                     resolver=runtime.resolver,
                     pool=runtime.pool,
@@ -519,105 +682,123 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     candidates=attempt_candidates or None,
                 )
             except UpstreamError as exc:
-                status = exc.status_code if 400 <= exc.status_code < 600 else 502
+                if is_session_limit_error(exc):
+                    raise _SessionLimitSignal(exc) from exc
                 return JSONResponse(
-                    status_code=status,
-                    content=openai_error(str(exc), status, code=exc.code),
+                    status_code=exc.status_code if exc.status_code >= 400 else 502,
+                    content=openai_error(str(exc), exc.status_code, code=exc.code),
                 )
-            except httpx.HTTPError:
-                return JSONResponse(
-                    status_code=502,
-                    content=openai_error("Upstream stream connection failed", 502),
-                )
-            media_type = response.headers.get("content-type", "").partition(";")[0].strip().lower()
-            if media_type in ("application/json", "text/html") or media_type.endswith("+json"):
-                try:
-                    raw = bytearray()
-                    if media_type != "text/html":
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            if len(raw) + len(chunk) > 64 * 1024:
-                                raw.clear()
-                                break
-                            raw.extend(chunk)
-                    parsed = json.loads(raw) if raw else None
-                except (httpx.HTTPError, ValueError):
-                    parsed = None
-                finally:
-                    await _close_chat_response(stream_cm)
-                status = chat_error_status(parsed, 502) if _is_chat_error(parsed) else 502
-                return JSONResponse(
-                    status_code=status,
-                    content=openai_error(
-                        _safe_upstream_error(parsed) or "Upstream returned a non-stream response",
-                        status,
-                        code=upstream_error_code(parsed),
-                    ),
-                )
-            events = _chat_stream_events(response)
-            resources = _ChatStreamResources(stream_cm, events)
-            handoff = False
+            if is_session_limit_payload(raw):
+                raise _SessionLimitSignal(UpstreamError(
+                    _safe_upstream_error(raw) or "Upstream returned a chat error",
+                    chat_error_status(raw, 502),
+                    raw,
+                ))
+            if _is_chat_error(raw):
+                status = chat_error_status(raw, 502)
+                return JSONResponse(status_code=status, content=openai_error(
+                    _safe_upstream_error(raw) or "Upstream returned a chat error", status, code=upstream_error_code(raw),
+                ))
+            completion = normalize_completion(raw, model)
+            if not aliases:
+                return completion
             try:
-                # InferHub also returns request errors as the first event of a
-                # HTTP 200. Classify them before HTTP headers are committed.
-                first = await anext(events, None)
-                if first is None or first == "[DONE]":
-                    return JSONResponse(status_code=502, content=openai_error("Upstream sent an empty stream", 502))
-                if _is_chat_error(first):
-                    status = chat_error_status(first, 502)
-                    return JSONResponse(
-                        status_code=status,
-                        content=openai_error(
-                            _safe_upstream_error(first) or "Upstream stream returned an error",
-                            status,
-                            code=upstream_error_code(first),
-                        ),
-                    )
-                handoff = True
-            except (httpx.HTTPError, ValueError):
-                return JSONResponse(
-                    status_code=502, content=openai_error("Could not read the upstream stream", 502),
-                )
-            finally:
-                if not handoff:
-                    await resources.aclose()
-            return _ChatStreamingResponse(
-                _stream_chat(resources, events, first, model, aliases),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-                resources=resources,
+                return restore_completion_tools(completion, aliases)
+            except ValueError:
+                return JSONResponse(status_code=502, content=openai_error("Invalid upstream tool response", 502))
+
+        def note_session_limit(signal: _SessionLimitSignal) -> None:
+            """Release the capped account's slot and record its backoff."""
+            nonlocal limit_attempts
+            limited_id = ticket.account_id
+            # The attempt already closed the upstream response; only now is
+            # the account slot released.
+            ticket.unbind()
+            if limited_id is not None:
+                limit_backoff[limited_id] = time.monotonic() + next_session_limit_delay(limit_attempts)
+            limit_attempts += 1
+            logger.info(
+                "upstream session cap account=%s status=%s; polling again (attempt %d)",
+                limited_id,
+                signal.error.status_code,
+                limit_attempts,
             )
 
+        # Fast path: the first attempt runs exactly like an uncapped request,
+        # with no disconnect watcher; only a capped conversation enters the
+        # polling phase below.
         try:
-            raw = await post_chat_with_failover(
-                client=runtime.snap(),
-                resolver=runtime.resolver,
-                pool=runtime.pool,
-                payload=upstream_payload,
-                session_id=session_id,
-                ticket=ticket,
-                candidates=attempt_candidates or None,
-            )
-        except UpstreamError as exc:
-            return JSONResponse(
-                status_code=exc.status_code if exc.status_code >= 400 else 502,
-                content=openai_error(str(exc), exc.status_code, code=exc.code),
-            )
-        if _is_chat_error(raw):
-            status = chat_error_status(raw, 502)
-            return JSONResponse(status_code=status, content=openai_error(
-                _safe_upstream_error(raw) or "Upstream returned a chat error", status, code=upstream_error_code(raw),
-            ))
-        completion = normalize_completion(raw, model)
-        if not aliases:
-            return completion
-        try:
-            return restore_completion_tools(completion, aliases)
-        except ValueError:
-            return JSONResponse(status_code=502, content=openai_error("Invalid upstream tool response", 502))
+            return await attempt_once()
+        except _SessionLimitSignal as signal:
+            note_session_limit(signal)
+
+        disconnected = False
+        response: Any = None
+        async with anyio.create_task_group() as poll_group:
+
+            async def watch() -> None:
+                nonlocal disconnected
+                while True:
+                    message = await request.receive()
+                    if message.get("type") == "http.disconnect":
+                        disconnected = True
+                        ticket.peer_disconnected = True
+                        poll_group.cancel_scope.cancel()
+                        return
+
+            poll_group.start_soon(watch)
+            try:
+                # Let the watcher read a disconnect that is already queued
+                # before the first retry starts on another account.
+                await anyio.sleep(0)
+                while True:
+                    if disconnected:
+                        # A gone client must not start work on another account.
+                        break
+                    if ticket.account_id is None:
+                        # Between polls: pick the next account, or wait for one.
+                        if not runtime.pool.peek_candidates():
+                            # The pool emptied mid-poll (accounts removed or
+                            # disabled): permanent, not a cap to wait out.
+                            response = JSONResponse(
+                                status_code=503,
+                                content=openai_error("No healthy accounts available in the pool", 503),
+                            )
+                            break
+                        candidates = poll_candidates()
+                        if candidates is None:
+                            now = time.monotonic()
+                            pending = [deadline for deadline in limit_backoff.values() if deadline > now]
+                            if pending:
+                                # Sleep until the earliest capped account may retry.
+                                delay = min(pending) - now
+                            else:
+                                # Accounts exist but all sit at their local cap.
+                                delay = next_session_limit_delay(limit_attempts)
+                                limit_attempts += 1
+                            await anyio.sleep(delay)
+                            continue
+                        attempt_candidates[:] = candidates
+                    if disconnected:
+                        break
+                    try:
+                        response = await attempt_once()
+                        break
+                    except _SessionLimitSignal as signal:
+                        note_session_limit(signal)
+            finally:
+                # Stop the watcher before the response (streamed or not) is
+                # handed back, so it never races the receive that follows.
+                poll_group.cancel_scope.cancel()
+        if disconnected:
+            # The client left while a poll was in flight. Never hand a fresh
+            # stream to a peer that cannot read it: tracked_send would drop
+            # every message while the upstream kept streaming to the end.
+            if isinstance(response, _ChatStreamingResponse):
+                with anyio.CancelScope(shield=True):
+                    await response._resources.aclose()
+            return _chat_queue_error(QueueResult.DISCONNECTED)
+        return response
 
     @protected.post("/admin/checkin")
     async def post_checkin(

@@ -16,7 +16,14 @@ from codearts2api.checkin import (
     is_credit_account,
     run_checkin,
 )
-from codearts2api.client import SnapAccessClient, UpstreamError, _error_message, chat_error_status
+from codearts2api.client import (
+    SnapAccessClient,
+    UpstreamError,
+    _error_message,
+    chat_error_status,
+    is_session_limit_error,
+    is_session_limit_message,
+)
 from codearts2api.credentials import CredentialResolver, ResolvedCredential
 from codearts2api.pool import (
     Account,
@@ -464,13 +471,21 @@ def _parse_stream_error(raw: bytes, content_type: str) -> Any:
                     continue
                 if isinstance(value, dict):
                     return value
+    # Plain-text error bodies: recognize only the exact session-cap wording
+    # and answer with a fixed safe message, never the raw body.
+    media_type = content_type.partition(";")[0].strip().lower()
+    if media_type in ("", "text/plain") and is_session_limit_message(text):
+        return {"error_msg": "并发会话数已达上限，请关闭部分会话后重试。"}
     return None
 
 
 def _is_session_limit_error(error: UpstreamError) -> bool:
-    """Avoid moving a capped conversation onto an unrelated pooled account."""
-    message = str(error)
-    return "并发会话数" in message and "上限" in message
+    """Avoid moving a capped conversation onto an unrelated pooled account.
+
+    The app-level polling loop owns retries for this error; failover only
+    needs to recognize it so the account is neither cooled down nor skipped.
+    """
+    return is_session_limit_error(error)
 
 
 async def list_models_with_failover(

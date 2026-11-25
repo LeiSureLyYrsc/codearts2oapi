@@ -45,9 +45,10 @@ def test_http_400_is_json_error_not_sse(settings: Settings) -> None:
         client.__exit__(None, None, None)
 
 
+# The concurrent-session-cap case (并发会话数已达上限) no longer fails here: the
+# gateway polls upstream until it recovers (see tests/test_chat_session_limit_retry.py).
 @pytest.mark.parametrize(("text", "code", "status"), [
     ("The request param is invalid, Please check it", "InferHub.001001005.400", 400),
-    ("并发会话数已达上限(3个)，请关闭部分会话后重试。", None, 429),
 ])
 def test_first_sse_error_is_a_real_http_error(settings, text, code, status):
     requests = []

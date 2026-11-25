@@ -343,12 +343,40 @@ def upstream_error_code(payload: Any) -> str | None:
     return None
 
 
+def is_session_limit_message(message: str) -> bool:
+    """Explicit provider concurrent-session cap; a generic 429 never matches."""
+    return "并发会话数" in message and "上限" in message
+
+
+def is_session_limit_payload(payload: Any) -> bool:
+    """True only when an error envelope explicitly reports the session cap."""
+    if not isinstance(payload, dict):
+        return False
+    return is_session_limit_message(_error_message(payload, 0))
+
+
+def is_session_limit_error(error: UpstreamError) -> bool:
+    """True when an upstream failure is the explicit concurrent-session cap.
+
+    Only HTTP 400/429 qualify (or a success-envelope payload checked via
+    ``is_session_limit_payload``): a 401/403/5xx that happens to echo the cap
+    text keeps its normal error and failover semantics.
+    """
+    if error.status_code not in (400, 429):
+        return False
+    if is_session_limit_message(str(error)) or is_session_limit_payload(error.payload):
+        return True
+    # A text/plain (or otherwise non-JSON) error body arrives as a raw string;
+    # match only the exact cap wording, never arbitrary text.
+    return isinstance(error.payload, str) and is_session_limit_message(error.payload)
+
+
 def chat_error_status(payload: Any, default: int) -> int:
     """Infer HTTP status for an in-band chat error without guessing generic errors."""
     if not isinstance(payload, dict):
         return default
     message = _error_message(payload, default)
-    if "并发会话数" in message and "上限" in message:
+    if is_session_limit_message(message):
         return 429
     code = upstream_error_code(payload)
     if code and code.lower().startswith("inferhub."):
